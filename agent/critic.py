@@ -32,11 +32,14 @@ Respond with ONLY a JSON object (no prose, no markdown fences):
   "instructions_for_revision": string  // empty string if approved; otherwise concrete, specific fixes
 }
 Be a genuinely skeptical reviewer -- approving a flawed report defeats the point of this step.
+List AT MOST the 6 most important issues, ranked by severity -- do not enumerate every minor or
+repetitive inconsistency. Keep each issue to one concise sentence. Your entire response must be
+valid, complete JSON; being concise matters more than being exhaustive.
 """
 
 
 def critique(draft: dict, specialist_reports: dict, log_fn=None) -> dict:
-    agent = ToolAgent(name="Critic", system_prompt=CRITIC_SYSTEM_PROMPT, model=CRITIC_MODEL, log_fn=log_fn)
+    agent = ToolAgent(name="Critic", system_prompt=CRITIC_SYSTEM_PROMPT, model=CRITIC_MODEL, max_output_tokens=3500, log_fn=log_fn)
     payload = {"draft_report": draft, "specialist_reports": specialist_reports}
     return agent.run(json.dumps(payload, indent=2))
 
