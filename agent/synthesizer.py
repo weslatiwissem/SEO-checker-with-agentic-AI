@@ -47,7 +47,7 @@ use judgment, but stay grounded in the evidence provided.
 def run_synthesizer(
     url: str, specialist_reports: dict[str, dict], previous_audit: dict | None, log_fn=None
 ) -> dict:
-    agent = ToolAgent(name="Synthesizer", system_prompt=SYNTHESIZER_SYSTEM_PROMPT, model=DEFAULT_MODEL, log_fn=log_fn)
+    agent = ToolAgent(name="Synthesizer", system_prompt=SYNTHESIZER_SYSTEM_PROMPT, model=DEFAULT_MODEL, max_output_tokens=3500, log_fn=log_fn)
 
     payload = {
         "url": url,
