@@ -34,15 +34,13 @@ FETCH_PAGE = _tool(
 PARSE_SEO_ELEMENTS = _tool(
     "parse_seo_elements",
     (
-        "Parse raw HTML (from a prior fetch_page call) and extract on-page SEO "
-        "signals: title, meta description, headings, images missing alt text, "
-        "internal/external links, structured data, Open Graph tags, word count."
+        "Extract on-page SEO signals for a URL you already fetched with fetch_page: "
+        "title, meta description, headings, images missing alt text, internal/external "
+        "links, structured data, Open Graph tags, word count. Just pass the same url -- "
+        "the HTML is cached server-side, do NOT try to pass HTML content yourself."
     ),
-    {
-        "html": {"type": "string", "description": "Raw HTML string returned by fetch_page"},
-        "base_url": {"type": "string", "description": "The URL the HTML was fetched from"},
-    },
-    ["html", "base_url"],
+    {"url": {"type": "string", "description": "The same URL previously fetched with fetch_page"}},
+    ["url"],
 )
 
 FETCH_ROBOTS_TXT = _tool(
