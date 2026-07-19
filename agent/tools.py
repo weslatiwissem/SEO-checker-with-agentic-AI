@@ -9,6 +9,7 @@ import ssl
 import socket
 import time
 import json
+from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 
 import requests
@@ -206,11 +207,26 @@ def check_ssl_certificate(domain_or_url: str) -> dict:
         with socket.create_connection((hostname, 443), timeout=DEFAULT_TIMEOUT) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert = ssock.getpeercert()
+
+        expires_raw = cert.get("notAfter")
+        is_expired = None
+        days_until_expiry = None
+        if expires_raw:
+            # e.g. "Aug 18 12:44:57 2026 GMT" -- parse and compare ourselves so
+            # the model never has to reason about date arithmetic (it gets
+            # this wrong, especially smaller models -- compute it here instead).
+            expires_dt = datetime.strptime(expires_raw, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            is_expired = expires_dt < now
+            days_until_expiry = (expires_dt - now).days
+
         return {
             "ok": True,
             "has_valid_ssl": True,
             "issuer": dict(x[0] for x in cert.get("issuer", [])),
-            "expires": cert.get("notAfter"),
+            "expires": expires_raw,
+            "is_expired": is_expired,  # authoritative True/False -- trust this field, not date math on 'expires'
+            "days_until_expiry": days_until_expiry,
             "subject": dict(x[0] for x in cert.get("subject", [])),
         }
     except Exception as e:

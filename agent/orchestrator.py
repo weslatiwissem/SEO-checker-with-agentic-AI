@@ -30,6 +30,35 @@ def _run_one_specialist(key: str, url: str, competitor_url: str | None, log_fn) 
     return key, result
 
 
+def _reconcile_overall_score(report: dict, log_fn) -> None:
+    """LLMs (especially smaller ones) are unreliable at weighted-average
+    arithmetic -- the critic repeatedly catches "overall_score doesn't match
+    the weighted average" but that alone doesn't fix it. Recompute it
+    deterministically here rather than trusting the model's own math."""
+    categories = report.get("categories") or []
+    if not categories:
+        return
+
+    total_weight = sum(c.get("weight", 0) for c in categories)
+    if total_weight <= 0:
+        return
+
+    weighted_sum = sum(c.get("score", 0) * c.get("weight", 0) for c in categories)
+    computed_score = round(weighted_sum / total_weight, 1)
+
+    reported_score = report.get("overall_score")
+    if reported_score is None or abs(reported_score - computed_score) > 2:
+        log_fn(f"  -> Correcting overall_score: model said {reported_score}, "
+               f"actual weighted average is {computed_score}")
+        report["overall_score"] = computed_score
+        report["grade"] = (
+            "A" if computed_score >= 90 else
+            "B" if computed_score >= 80 else
+            "C" if computed_score >= 70 else
+            "D" if computed_score >= 60 else "F"
+        )
+
+
 def run_full_audit(
     url: str,
     competitor_url: str | None = None,
@@ -80,6 +109,18 @@ def run_full_audit(
     except ValidationError as e:
         log_fn(f"  -> WARNING: final report failed schema validation: {e}")
         final_report = draft  # surface the raw draft rather than crashing the whole run
+
+    _reconcile_overall_score(final_report, log_fn)
+
+    was_approved = bool(reflection_log) and reflection_log[-1].get("review", {}).get("approved")
+    if not was_approved:
+        unresolved = reflection_log[-1].get("review", {}).get("issues", []) if reflection_log else []
+        final_report["review_status"] = "not_approved"
+        final_report["unresolved_review_issues"] = unresolved
+        log_fn(f"  -> WARNING: report was NOT approved by the critic after "
+               f"{len(reflection_log)} round(s); treat findings with extra scrutiny.")
+    else:
+        final_report["review_status"] = "approved"
 
     final_report["_specialist_reports"] = specialist_reports
     final_report["_reflection_log"] = reflection_log

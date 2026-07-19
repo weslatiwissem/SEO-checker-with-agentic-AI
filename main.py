@@ -31,6 +31,12 @@ def print_report(report: dict) -> None:
     print("=" * 64)
     print(f"Overall Score: {report.get('overall_score')}/100  (Grade: {report.get('grade')})")
 
+    if report.get("review_status") == "not_approved":
+        print("\n⚠ WARNING: this report was NOT approved by the critic's review after "
+              "multiple revision rounds. Treat findings with extra scrutiny -- unresolved issues:")
+        for issue in report.get("unresolved_review_issues", []):
+            print(f"    - {issue}")
+
     trend = report.get("trend")
     if trend:
         delta = trend.get("score_delta", 0)

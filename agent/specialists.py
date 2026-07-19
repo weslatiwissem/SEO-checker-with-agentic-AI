@@ -30,7 +30,9 @@ SPECIALIST_DEFINITIONS = {
 indexability of the given URL: HTTP status code, redirect chains, canonical tags, robots.txt
 (existence + sitemap reference), sitemap.xml (existence + size), and SSL certificate validity.
 Use fetch_page first, then parse_seo_elements on the same url, then fetch_robots_txt,
-fetch_sitemap, and check_ssl_certificate.
+fetch_sitemap, and check_ssl_certificate. check_ssl_certificate returns an authoritative
+"is_expired" boolean field -- trust that field directly, do not try to compute expiry
+yourself from the raw "expires" date string.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "content": {
@@ -57,7 +59,9 @@ measurement is possible without a real browser) -- frame your findings as proxy 
 certificate validity and HTTP security headers (HSTS, Content-Security-Policy,
 X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy).
 Use fetch_page first (to get headers), then check_ssl_certificate, then
-analyze_security_headers on the headers dict returned by fetch_page.
+analyze_security_headers on the headers dict returned by fetch_page. check_ssl_certificate
+returns an authoritative "is_expired" boolean field -- trust that field directly for whether
+the certificate has expired, do not try to compute this yourself from the raw "expires" date string.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "links": {
