@@ -17,6 +17,12 @@ from bs4 import BeautifulSoup
 USER_AGENT = "SEOHealthAgent/2.0 (+https://example.com/bot)"
 DEFAULT_TIMEOUT = 10
 
+# Server-side cache: url -> raw HTML. This exists so fetched HTML never has to
+# be sent through the model's context (which was previously blowing through
+# the free-tier token budget in one or two tool calls). Tools that need the
+# HTML look it up here instead of receiving it as a function argument.
+_page_cache: dict[str, str] = {}
+
 
 def normalize_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
@@ -25,7 +31,9 @@ def normalize_url(url: str) -> str:
 
 
 def fetch_page(url: str) -> dict:
-    """Fetch a page and return status, timing, headers, and raw HTML."""
+    """Fetch a page, cache its HTML server-side, and return only lightweight
+    metadata to the model (status, timing, headers) -- NOT the HTML itself.
+    Call parse_seo_elements with the same url to extract SEO signals."""
     url = normalize_url(url)
     try:
         start = time.time()
@@ -36,6 +44,8 @@ def fetch_page(url: str) -> dict:
             allow_redirects=True,
         )
         elapsed_ms = round((time.time() - start) * 1000, 1)
+        _page_cache[url] = resp.text
+        _page_cache[resp.url] = resp.text
         return {
             "ok": True,
             "requested_url": url,
@@ -46,14 +56,32 @@ def fetch_page(url: str) -> dict:
             "response_time_ms": elapsed_ms,
             "content_length_bytes": len(resp.content),
             "headers": dict(resp.headers),
-            "html": resp.text[:200_000],
+            "note": "HTML fetched and cached server-side. Call parse_seo_elements(url=...) "
+                    "with this same url to extract SEO signals -- do not request raw HTML.",
         }
     except requests.exceptions.RequestException as e:
         return {"ok": False, "requested_url": url, "error": str(e)}
 
 
-def parse_seo_elements(html: str, base_url: str) -> dict:
-    """Extract on-page SEO signals from HTML."""
+def _get_cached_html(url: str) -> str | None:
+    """Look up previously-fetched HTML, fetching fresh if not cached."""
+    url_n = normalize_url(url)
+    if url_n in _page_cache:
+        return _page_cache[url_n]
+    result = fetch_page(url_n)
+    if result.get("ok"):
+        return _page_cache.get(result["final_url"]) or _page_cache.get(url_n)
+    return None
+
+
+def parse_seo_elements(url: str) -> dict:
+    """Extract on-page SEO signals for a previously-fetched url. Looks up the
+    server-side HTML cache populated by fetch_page (fetches fresh if needed)."""
+    html = _get_cached_html(url)
+    if html is None:
+        return {"ok": False, "error": f"Could not retrieve HTML for {url}. Try fetch_page first."}
+    base_url = normalize_url(url)
+
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
