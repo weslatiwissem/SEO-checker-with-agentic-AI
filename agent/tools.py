@@ -211,6 +211,7 @@ def check_ssl_certificate(domain_or_url: str) -> dict:
         expires_raw = cert.get("notAfter")
         is_expired = None
         days_until_expiry = None
+        summary = "SSL status could not be determined."
         if expires_raw:
             # e.g. "Aug 18 12:44:57 2026 GMT" -- parse and compare ourselves so
             # the model never has to reason about date arithmetic (it gets
@@ -219,14 +220,21 @@ def check_ssl_certificate(domain_or_url: str) -> dict:
             now = datetime.now(timezone.utc)
             is_expired = expires_dt < now
             days_until_expiry = (expires_dt - now).days
+            summary = (
+                f"CERTIFICATE IS EXPIRED (expired {-days_until_expiry} day(s) ago)."
+                if is_expired else
+                f"Certificate is VALID and NOT expired ({days_until_expiry} day(s) remaining "
+                f"until it expires on {expires_raw})."
+            )
 
         return {
             "ok": True,
             "has_valid_ssl": True,
             "issuer": dict(x[0] for x in cert.get("issuer", [])),
             "expires": expires_raw,
-            "is_expired": is_expired,  # authoritative True/False -- trust this field, not date math on 'expires'
+            "is_expired": is_expired,
             "days_until_expiry": days_until_expiry,
+            "ssl_status_summary": summary,  # READ THIS FIELD -- it's the authoritative, pre-computed answer
             "subject": dict(x[0] for x in cert.get("subject", [])),
         }
     except Exception as e:

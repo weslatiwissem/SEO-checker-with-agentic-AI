@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 
 from .base_agent import ToolAgent
-from .config import DEFAULT_MODEL
+from .config import DEFAULT_MODEL, FALLBACK_MODEL
 
 SYNTHESIZER_SYSTEM_PROMPT = """You are the synthesizer agent in a multi-agent SEO audit system.
 You receive independent JSON reports from several specialist agents (technical SEO, content,
@@ -45,9 +45,11 @@ use judgment, but stay grounded in the evidence provided.
 
 
 def run_synthesizer(
-    url: str, specialist_reports: dict[str, dict], previous_audit: dict | None, log_fn=None
+    url: str, specialist_reports: dict[str, dict], previous_audit: dict | None,
+    model: str = DEFAULT_MODEL, fallback_model: str | None = FALLBACK_MODEL, log_fn=None
 ) -> dict:
-    agent = ToolAgent(name="Synthesizer", system_prompt=SYNTHESIZER_SYSTEM_PROMPT, model=DEFAULT_MODEL, max_output_tokens=3500, log_fn=log_fn)
+    agent = ToolAgent(name="Synthesizer", system_prompt=SYNTHESIZER_SYSTEM_PROMPT, model=model,
+                       fallback_model=fallback_model, max_output_tokens=3500, log_fn=log_fn)
 
     payload = {
         "url": url,

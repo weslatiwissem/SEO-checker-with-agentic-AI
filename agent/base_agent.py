@@ -16,7 +16,7 @@ import groq
 from groq import Groq
 
 from . import tools
-from .config import DEFAULT_MODEL, MAX_TOOL_ITERATIONS, RATE_LIMIT_MAX_RETRIES, FALLBACK_MODEL
+from .config import DEFAULT_MODEL, MAX_TOOL_ITERATIONS, RATE_LIMIT_MAX_RETRIES, FALLBACK_MODEL, GROQ_API_KEYS
 
 TOOL_IMPL: dict[str, Callable[[dict], dict]] = {
     "fetch_page": lambda args: tools.fetch_page(args["url"]),
@@ -105,6 +105,7 @@ class ToolAgent:
         system_prompt: str,
         client_tools: list[dict] | None = None,
         model: str = DEFAULT_MODEL,
+        fallback_model: str | None = FALLBACK_MODEL,
         max_iterations: int = MAX_TOOL_ITERATIONS,
         max_output_tokens: int = 2048,
         log_fn: Callable[[str], None] | None = None,
@@ -113,25 +114,42 @@ class ToolAgent:
         self.system_prompt = system_prompt
         self.client_tools = client_tools or []
         self.model = model
+        self.fallback_model = fallback_model
         self.max_iterations = max_iterations
         self.max_output_tokens = max_output_tokens
         self.log = log_fn or (lambda msg: None)
         self._client = None
+        self._key_index = 0
+        self._original_model = model  # restored when rotating to a fresh API key
+        self.tool_call_log: list[dict] = []  # [{"name": ..., "args": ..., "result": ...}] for post-hoc verification
 
     @property
     def client(self) -> Groq:
         if self._client is None:
-            self._client = Groq()  # picks up GROQ_API_KEY from env
+            api_key = GROQ_API_KEYS[self._key_index] if GROQ_API_KEYS else None
+            self._client = Groq(api_key=api_key) if api_key else Groq()
         return self._client
 
+    def _rotate_api_key(self) -> bool:
+        """Switch to the next configured GROQ_API_KEYS entry (a separate
+        quota pool) and reset back to this agent's original model, since a
+        fresh key means a fresh daily quota on the primary model too.
+        Returns False if there's no next key configured."""
+        if self._key_index + 1 >= len(GROQ_API_KEYS):
+            return False
+        self._key_index += 1
+        self._client = None  # force recreation with the new key
+        self.model = self._original_model
+        return True
+
     def _call_with_retry(self, **kwargs):
-        """Call the Groq API, handling two distinct failure modes:
-        - 429 rate/quota limit: prefer immediately switching to FALLBACK_MODEL
-          (a separate quota pool, zero wait) over sleeping through the
-          primary model's limit.
+        """Call the Groq API, handling failure modes in order of preference:
         - 413 (or 429-labeled "reduce your message size") request-too-large:
-          no amount of waiting or model-switching helps here -- shrink the
-          largest message in the conversation and retry.
+          shrink the largest message in the conversation and retry.
+        - 429 rate/quota limit: try this agent's fallback_model first (a
+          separate quota pool, zero wait); if that's also exhausted, try
+          the next configured GROQ_API_KEYS entry (another fresh quota
+          pool); only if both are unavailable/exhausted do we wait or fail.
         Any other status error is re-raised immediately, unmodified."""
         last_error = None
         fell_back = False
@@ -162,26 +180,33 @@ class ToolAgent:
                     raise  # not a rate/quota/size issue -- don't swallow unrelated errors
 
                 current_model = kwargs.get("model")
-                if FALLBACK_MODEL and not fell_back and current_model != FALLBACK_MODEL:
+                if self.fallback_model and not fell_back and current_model != self.fallback_model:
                     self.log(
                         f"[{self.name}] '{current_model}' rate/quota limited -- switching to "
-                        f"fallback model '{FALLBACK_MODEL}' instead of waiting..."
+                        f"fallback model '{self.fallback_model}' instead of waiting..."
                     )
-                    kwargs["model"] = FALLBACK_MODEL
-                    self.model = FALLBACK_MODEL  # sticky for the rest of this agent's run
+                    kwargs["model"] = self.fallback_model
+                    self.model = self.fallback_model  # sticky for the rest of this agent's run
                     fell_back = True
                     continue  # retry immediately, no sleep needed
 
                 wait = _seconds_to_wait(e, attempt)
 
                 if wait is None:
-                    fallback_note = f" (even after falling back to '{FALLBACK_MODEL}')" if fell_back else ""
+                    if self._rotate_api_key():
+                        self.log(f"[{self.name}] models exhausted on this API key -- "
+                                  f"switching to next configured GROQ_API_KEYS entry...")
+                        kwargs["model"] = self.model
+                        fell_back = False  # allow falling back again under the fresh key
+                        continue
+
+                    fallback_note = f" (even after falling back to '{self.fallback_model}')" if fell_back else ""
                     raise RuntimeError(
                         f"[{self.name}] hit a Groq rate/quota limit requiring a wait longer than "
                         f"{MAX_AUTO_WAIT_SECONDS // 60} minutes{fallback_note}. This usually means "
-                        f"your daily token quota (TPD) is exhausted. Wait for it to reset or "
-                        f"upgrade your tier at https://console.groq.com/settings/billing.\n\n"
-                        f"Groq's message: {message_text}"
+                        f"your daily token quota (TPD) is exhausted. Wait for it to reset, add another "
+                        f"key to GROQ_API_KEYS, or upgrade your tier at "
+                        f"https://console.groq.com/settings/billing.\n\nGroq's message: {message_text}"
                     ) from e
 
                 if attempt == RATE_LIMIT_MAX_RETRIES:
@@ -250,11 +275,13 @@ class ToolAgent:
 
             for tc in tool_calls:
                 self.log(f"[{self.name}] -> {tc.function.name}({tc.function.arguments[:150]})")
+                args = None
                 try:
                     args = json.loads(tc.function.arguments)
                     result = TOOL_IMPL[tc.function.name](args)
                 except Exception as e:
                     result = {"ok": False, "error": f"Tool execution failed: {e}"}
+                self.tool_call_log.append({"name": tc.function.name, "args": args, "result": result})
                 messages.append(
                     {
                         "role": "tool",

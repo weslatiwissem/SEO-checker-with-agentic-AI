@@ -18,15 +18,40 @@ from .planner import run_planner
 from .specialists import build_specialist, SPECIALIST_DEFINITIONS
 from .critic import reflect_and_revise
 from .schemas import validate_report, ValidationError
-from .config import MAX_PARALLEL_SPECIALISTS, SPECIALIST_DISPATCH_STAGGER_SECONDS
+from .postprocess import reconcile_ssl_findings
+from .config import (
+    MAX_PARALLEL_SPECIALISTS, SPECIALIST_DISPATCH_STAGGER_SECONDS,
+    DEFAULT_MODEL, FALLBACK_MODEL, COMPETITIVE_MODEL, PLANNER_MODEL, CRITIC_MODEL,
+)
+
+# Three ways to run an audit, trading speed/cost against quality:
+# - "quick": everything runs on the small, fast, always-available fallback
+#   model. No automatic model-switching needed since it's already the
+#   cheapest tier. Fastest and least likely to hit any rate limit.
+# - "deep": everything runs on the strong primary model, with automatic
+#   fallback to the smaller model DISABLED -- if the primary's quota is
+#   exhausted, agents wait or fail rather than silently using a weaker
+#   model. Slowest but most consistent quality.
+# - "auto" (default): current behavior -- try the primary model, silently
+#   fall back to the smaller one if/when its quota runs out.
+MODE_CONFIGS = {
+    "quick": {"primary": FALLBACK_MODEL, "planner": FALLBACK_MODEL, "critic": FALLBACK_MODEL,
+              "competitive": FALLBACK_MODEL, "fallback": None},
+    "deep": {"primary": DEFAULT_MODEL, "planner": PLANNER_MODEL, "critic": CRITIC_MODEL,
+             "competitive": COMPETITIVE_MODEL, "fallback": None},
+    "auto": {"primary": DEFAULT_MODEL, "planner": PLANNER_MODEL, "critic": CRITIC_MODEL,
+             "competitive": COMPETITIVE_MODEL, "fallback": FALLBACK_MODEL},
+}
 
 
-def _run_one_specialist(key: str, url: str, competitor_url: str | None, log_fn) -> tuple[str, dict]:
-    agent = build_specialist(key, log_fn=log_fn)
+def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dict, log_fn) -> tuple[str, dict]:
+    model = cfg["competitive"] if key == "competitive" else cfg["primary"]
+    agent = build_specialist(key, log_fn=log_fn, model=model, fallback_model=cfg["fallback"])
     task = f"Target URL: {url}"
     if key == "competitive" and competitor_url:
         task += f"\nCompetitor URL to compare against: {competitor_url}"
     result = agent.run(task)
+    result = reconcile_ssl_findings(result, agent.tool_call_log, log_fn=log_fn)
     return key, result
 
 
@@ -63,14 +88,19 @@ def run_full_audit(
     url: str,
     competitor_url: str | None = None,
     use_memory: bool = True,
+    mode: str = "auto",
     log_fn: Callable[[str], None] | None = None,
 ) -> dict:
     log_fn = log_fn or (lambda msg: None)
+    cfg = MODE_CONFIGS.get(mode, MODE_CONFIGS["auto"])
+    if mode not in MODE_CONFIGS:
+        log_fn(f"  -> Unknown mode '{mode}', defaulting to 'auto'.")
 
     previous_audit = memory.get_last_audit(url) if use_memory else None
 
-    log_fn("Stage 1/4: Planning audit scope...")
-    plan = run_planner(url, competitor_url, has_history=previous_audit is not None, log_fn=log_fn)
+    log_fn(f"Stage 1/4: Planning audit scope... (mode: {mode})")
+    plan = run_planner(url, competitor_url, has_history=previous_audit is not None,
+                        model=cfg["planner"], fallback_model=cfg["fallback"], log_fn=log_fn)
     specialist_keys = [k for k in plan.get("specialists", []) if k in SPECIALIST_DEFINITIONS]
     if not specialist_keys:
         specialist_keys = ["technical_seo", "content", "performance", "security", "links"]
@@ -84,7 +114,7 @@ def run_full_audit(
         for i, key in enumerate(specialist_keys):
             if i > 0:
                 time.sleep(SPECIALIST_DISPATCH_STAGGER_SECONDS)
-            futures[pool.submit(_run_one_specialist, key, url, competitor_url, log_fn)] = key
+            futures[pool.submit(_run_one_specialist, key, url, competitor_url, cfg, log_fn)] = key
 
         for future in as_completed(futures):
             key = futures[future]
@@ -102,7 +132,11 @@ def run_full_audit(
                 }
 
     log_fn("Stage 3/4: Synthesizing + critiquing report (reflection loop)...")
-    draft, reflection_log = reflect_and_revise(url, specialist_reports, previous_audit, log_fn=log_fn)
+    draft, reflection_log = reflect_and_revise(
+        url, specialist_reports, previous_audit,
+        synthesizer_model=cfg["primary"], critic_model=cfg["critic"],
+        fallback_model=cfg["fallback"], log_fn=log_fn,
+    )
 
     try:
         final_report = validate_report(draft)

@@ -11,7 +11,7 @@ import json
 
 from .base_agent import ToolAgent
 from .synthesizer import run_synthesizer
-from .config import CRITIC_MODEL, MAX_REFLECTION_ROUNDS
+from .config import CRITIC_MODEL, MAX_REFLECTION_ROUNDS, DEFAULT_MODEL, FALLBACK_MODEL
 
 CRITIC_SYSTEM_PROMPT = """You are the critic agent in a multi-agent SEO audit system. You review
 a draft report produced by a synthesizer agent against the raw specialist findings it was built
@@ -38,8 +38,10 @@ valid, complete JSON; being concise matters more than being exhaustive.
 """
 
 
-def critique(draft: dict, specialist_reports: dict, log_fn=None) -> dict:
-    agent = ToolAgent(name="Critic", system_prompt=CRITIC_SYSTEM_PROMPT, model=CRITIC_MODEL, max_output_tokens=3500, log_fn=log_fn)
+def critique(draft: dict, specialist_reports: dict, model: str = CRITIC_MODEL,
+             fallback_model: str | None = FALLBACK_MODEL, log_fn=None) -> dict:
+    agent = ToolAgent(name="Critic", system_prompt=CRITIC_SYSTEM_PROMPT, model=model,
+                       fallback_model=fallback_model, max_output_tokens=3500, log_fn=log_fn)
     payload = {"draft_report": draft, "specialist_reports": specialist_reports}
     return agent.run(json.dumps(payload, indent=2))
 
@@ -48,16 +50,21 @@ def reflect_and_revise(
     url: str,
     specialist_reports: dict[str, dict],
     previous_audit: dict | None,
+    synthesizer_model: str = DEFAULT_MODEL,
+    critic_model: str = CRITIC_MODEL,
+    fallback_model: str | None = FALLBACK_MODEL,
     log_fn=None,
 ) -> tuple[dict, list[dict]]:
     """Run synthesizer -> critic -> (revise if needed) up to MAX_REFLECTION_ROUNDS times.
     Returns (final_report, reflection_log)."""
     reflection_log = []
 
-    draft = run_synthesizer(url, specialist_reports, previous_audit, log_fn=log_fn)
+    draft = run_synthesizer(url, specialist_reports, previous_audit, model=synthesizer_model,
+                             fallback_model=fallback_model, log_fn=log_fn)
 
     for round_num in range(1, MAX_REFLECTION_ROUNDS + 1):
-        review = critique(draft, specialist_reports, log_fn=log_fn)
+        review = critique(draft, specialist_reports, model=critic_model,
+                           fallback_model=fallback_model, log_fn=log_fn)
         reflection_log.append({"round": round_num, "review": review})
 
         if review.get("approved"):
@@ -73,7 +80,8 @@ def reflect_and_revise(
             "issues": review.get("issues"),
             "instructions": review.get("instructions_for_revision"),
         }
-        draft = run_synthesizer(url, revised_reports, previous_audit, log_fn=log_fn)
+        draft = run_synthesizer(url, revised_reports, previous_audit, model=synthesizer_model,
+                                 fallback_model=fallback_model, log_fn=log_fn)
     else:
         if log_fn:
             log_fn("[Critic] max reflection rounds reached; proceeding with latest draft.")

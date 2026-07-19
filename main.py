@@ -72,6 +72,7 @@ def cmd_audit(args):
             args.url,
             competitor_url=args.competitor,
             use_memory=not args.no_memory,
+            mode=args.mode,
             log_fn=_log if not args.quiet else (lambda m: None),
         )
     except RuntimeError as e:
@@ -108,6 +109,10 @@ def main():
 
     p_audit = sub.add_parser("audit", help="Run a full multi-agent audit on a URL")
     p_audit.add_argument("url", help="URL of the site to audit, e.g. https://example.com")
+    p_audit.add_argument("--mode", choices=["quick", "deep", "auto"], default="auto",
+                          help="quick: fast, always uses the small model. deep: best quality, "
+                               "only the strong model (waits/fails rather than downgrading). "
+                               "auto (default): strong model with automatic fallback.")
     p_audit.add_argument("--competitor", help="Optional competitor URL for benchmarking", default=None)
     p_audit.add_argument("--out", help="Write the full JSON report to this file", default=None)
     p_audit.add_argument("--pdf", help="Also export a polished PDF report to this path", default=None)

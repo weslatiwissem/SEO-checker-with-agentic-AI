@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from .base_agent import ToolAgent
 from .tool_schemas import TOOL_GROUPS
-from .config import DEFAULT_MODEL, COMPETITIVE_MODEL
+from .config import DEFAULT_MODEL, COMPETITIVE_MODEL, FALLBACK_MODEL
 
 SPECIALIST_OUTPUT_CONTRACT = """
 Respond with ONLY a single JSON object (no prose, no markdown fences) shaped exactly like:
@@ -30,9 +30,11 @@ SPECIALIST_DEFINITIONS = {
 indexability of the given URL: HTTP status code, redirect chains, canonical tags, robots.txt
 (existence + sitemap reference), sitemap.xml (existence + size), and SSL certificate validity.
 Use fetch_page first, then parse_seo_elements on the same url, then fetch_robots_txt,
-fetch_sitemap, and check_ssl_certificate. check_ssl_certificate returns an authoritative
-"is_expired" boolean field -- trust that field directly, do not try to compute expiry
-yourself from the raw "expires" date string.
+fetch_sitemap, and check_ssl_certificate. check_ssl_certificate returns a "ssl_status_summary"
+field with the authoritative, pre-computed answer in plain English (e.g. "Certificate is VALID
+and NOT expired..."). Quote that field directly in your finding -- do NOT independently judge
+expiry from the raw "expires" date string, and do NOT report an SSL certificate as expired
+unless ssl_status_summary explicitly says "CERTIFICATE IS EXPIRED".
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "content": {
@@ -60,8 +62,10 @@ certificate validity and HTTP security headers (HSTS, Content-Security-Policy,
 X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy).
 Use fetch_page first (to get headers), then check_ssl_certificate, then
 analyze_security_headers on the headers dict returned by fetch_page. check_ssl_certificate
-returns an authoritative "is_expired" boolean field -- trust that field directly for whether
-the certificate has expired, do not try to compute this yourself from the raw "expires" date string.
+returns a "ssl_status_summary" field with the authoritative, pre-computed answer in plain
+English (e.g. "Certificate is VALID and NOT expired..."). Quote that field directly in your
+finding -- do NOT independently judge expiry from the raw "expires" date string, and do NOT
+report the certificate as expired unless ssl_status_summary explicitly says "CERTIFICATE IS EXPIRED".
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "links": {
@@ -90,13 +94,15 @@ assumptions about "current" thresholds without checking, since these change over
 }
 
 
-def build_specialist(key: str, log_fn=None) -> ToolAgent:
+def build_specialist(key: str, log_fn=None, model: str | None = None, fallback_model: str | None = FALLBACK_MODEL) -> ToolAgent:
     definition = SPECIALIST_DEFINITIONS[key]
     is_competitive = key == "competitive"
+    effective_model = model or (COMPETITIVE_MODEL if is_competitive else DEFAULT_MODEL)
     return ToolAgent(
         name=definition["display_name"],
         system_prompt=definition["system_prompt"],
         client_tools=TOOL_GROUPS[key],
-        model=COMPETITIVE_MODEL if is_competitive else DEFAULT_MODEL,
+        model=effective_model,
+        fallback_model=fallback_model,
         log_fn=log_fn,
     )

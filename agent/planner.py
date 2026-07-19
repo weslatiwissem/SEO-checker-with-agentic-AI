@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from .base_agent import ToolAgent
 from .specialists import SPECIALIST_DEFINITIONS
-from .config import PLANNER_MODEL
+from .config import PLANNER_MODEL, FALLBACK_MODEL
 
 _SPECIALIST_LIST = "\n".join(
     f"- {key}: {d['display_name']}" for key, d in SPECIALIST_DEFINITIONS.items()
@@ -32,11 +32,13 @@ Respond with ONLY a JSON object (no prose, no markdown fences):
 """
 
 
-def run_planner(url: str, competitor_url: str | None, has_history: bool, log_fn=None) -> dict:
+def run_planner(url: str, competitor_url: str | None, has_history: bool, model: str = PLANNER_MODEL,
+                 fallback_model: str | None = FALLBACK_MODEL, log_fn=None) -> dict:
     agent = ToolAgent(
         name="Planner",
         system_prompt=PLANNER_SYSTEM_PROMPT,
-        model=PLANNER_MODEL,
+        model=model,
+        fallback_model=fallback_model,
         log_fn=log_fn,
     )
     context = f"Target URL: {url}"
