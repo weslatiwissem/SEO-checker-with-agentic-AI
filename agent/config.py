@@ -7,6 +7,12 @@ DEFAULT_MODEL = os.environ.get("SEO_AGENT_MODEL", "llama-3.3-70b-versatile")
 PLANNER_MODEL = os.environ.get("SEO_AGENT_PLANNER_MODEL", DEFAULT_MODEL)
 CRITIC_MODEL = os.environ.get("SEO_AGENT_CRITIC_MODEL", DEFAULT_MODEL)
 
+# Groq's per-model daily token quota (TPD) is tracked separately per model.
+# If the primary model's quota is exhausted, agents automatically fall back
+# to this smaller/faster model instead of failing outright, since it draws
+# from a completely separate quota pool. Set to "" to disable fallback.
+FALLBACK_MODEL = os.environ.get("SEO_AGENT_FALLBACK_MODEL", "llama-3.1-8b-instant")
+
 # Groq's built-in agentic "Compound" system, used only by the competitive/
 # benchmarking specialist. It performs live web search server-side, so no
 # custom tool schema is needed (and Groq does not allow mixing custom tools

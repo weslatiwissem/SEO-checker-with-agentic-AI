@@ -29,7 +29,7 @@ SPECIALIST_DEFINITIONS = {
         "system_prompt": f"""You are a Technical SEO specialist agent. Investigate crawlability and
 indexability of the given URL: HTTP status code, redirect chains, canonical tags, robots.txt
 (existence + sitemap reference), sitemap.xml (existence + size), and SSL certificate validity.
-Use fetch_page first, then parse_seo_elements on the returned HTML, then fetch_robots_txt,
+Use fetch_page first, then parse_seo_elements on the same url, then fetch_robots_txt,
 fetch_sitemap, and check_ssl_certificate.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
@@ -39,7 +39,7 @@ fetch_sitemap, and check_ssl_certificate.
 (ideal ~50-60 chars), meta description (ideal ~120-160 chars), heading structure (exactly one H1,
 logical H2/H3 nesting), word count / thin-content risk, image alt-text coverage, structured data
 (JSON-LD schema.org types), and Open Graph tags for social sharing.
-Use fetch_page first, then parse_seo_elements on the returned HTML.
+Use fetch_page first, then parse_seo_elements on the same url.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "performance": {
