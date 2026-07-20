@@ -21,7 +21,7 @@ from .schemas import validate_report, ValidationError
 from .postprocess import reconcile_ssl_findings
 from .config import (
     MAX_PARALLEL_SPECIALISTS, SPECIALIST_DISPATCH_STAGGER_SECONDS,
-    DEFAULT_MODEL, FALLBACK_MODEL, COMPETITIVE_MODEL, PLANNER_MODEL, CRITIC_MODEL,
+    DEFAULT_MODEL, FALLBACK_MODEL, COMPETITIVE_MODEL, PLANNER_MODEL, CRITIC_MODEL, GROQ_API_KEYS,
 )
 
 # Three ways to run an audit, trading speed/cost against quality:
@@ -44,9 +44,9 @@ MODE_CONFIGS = {
 }
 
 
-def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dict, log_fn) -> tuple[str, dict]:
+def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dict, key_index: int, log_fn) -> tuple[str, dict]:
     model = cfg["competitive"] if key == "competitive" else cfg["primary"]
-    agent = build_specialist(key, log_fn=log_fn, model=model, fallback_model=cfg["fallback"])
+    agent = build_specialist(key, log_fn=log_fn, model=model, fallback_model=cfg["fallback"], key_index=key_index)
     task = f"Target URL: {url}"
     if key == "competitive" and competitor_url:
         task += f"\nCompetitor URL to compare against: {competitor_url}"
@@ -59,16 +59,26 @@ def _reconcile_overall_score(report: dict, log_fn) -> None:
     """LLMs (especially smaller ones) are unreliable at weighted-average
     arithmetic -- the critic repeatedly catches "overall_score doesn't match
     the weighted average" but that alone doesn't fix it. Recompute it
-    deterministically here rather than trusting the model's own math."""
+    deterministically here rather than trusting the model's own math.
+    Categories with a null/missing score (e.g. a specialist that failed
+    outright) are excluded rather than treated as 0, and their weight is
+    excluded from the total so they don't silently drag the score down."""
     categories = report.get("categories") or []
     if not categories:
         return
 
-    total_weight = sum(c.get("weight", 0) for c in categories)
+    usable = [
+        c for c in categories
+        if isinstance(c.get("score"), (int, float)) and isinstance(c.get("weight"), (int, float))
+    ]
+    if not usable:
+        return
+
+    total_weight = sum(c["weight"] for c in usable)
     if total_weight <= 0:
         return
 
-    weighted_sum = sum(c.get("score", 0) * c.get("weight", 0) for c in categories)
+    weighted_sum = sum(c["score"] * c["weight"] for c in usable)
     computed_score = round(weighted_sum / total_weight, 1)
 
     reported_score = report.get("overall_score")
@@ -107,14 +117,20 @@ def run_full_audit(
     log_fn(f"  -> Plan: {specialist_keys} ({plan.get('reasoning', '')})")
 
     log_fn(f"Stage 2/4: Dispatching {len(specialist_keys)} specialist agents "
-           f"(max {MAX_PARALLEL_SPECIALISTS} concurrent, staggered)...")
+           f"(max {MAX_PARALLEL_SPECIALISTS} concurrent, staggered"
+           + (f", spread across {len(GROQ_API_KEYS)} API keys)..." if len(GROQ_API_KEYS) > 1 else ")..."))
     specialist_reports: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_SPECIALISTS, len(specialist_keys))) as pool:
         futures = {}
         for i, key in enumerate(specialist_keys):
             if i > 0:
                 time.sleep(SPECIALIST_DISPATCH_STAGGER_SECONDS)
-            futures[pool.submit(_run_one_specialist, key, url, competitor_url, cfg, log_fn)] = key
+            # Proactively spread specialists across available keys (round-robin)
+            # rather than only reactively rotating after one key's exhausted --
+            # with multiple keys this avoids ever hitting the limit in the
+            # first place for most runs.
+            key_index = i % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
+            futures[pool.submit(_run_one_specialist, key, url, competitor_url, cfg, key_index, log_fn)] = key
 
         for future in as_completed(futures):
             key = futures[future]

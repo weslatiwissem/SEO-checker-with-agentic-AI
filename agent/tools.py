@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ssl
 import socket
+import certifi
 import time
 import json
 from datetime import datetime, timezone
@@ -15,7 +16,10 @@ from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 
-USER_AGENT = "SEOHealthAgent/2.0 (+https://example.com/bot)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 DEFAULT_TIMEOUT = 10
 
 # Server-side cache: url -> raw HTML. This exists so fetched HTML never has to
@@ -203,7 +207,11 @@ def check_ssl_certificate(domain_or_url: str) -> dict:
     parsed = urlparse(normalize_url(domain_or_url))
     hostname = parsed.netloc.split(":")[0]
     try:
-        ctx = ssl.create_default_context()
+        # Use certifi's actively-maintained CA bundle (same one `requests` uses
+        # internally) instead of relying solely on the OS trust store, which can
+        # lag behind on some systems and cause false "certificate expired"
+        # verification failures for perfectly valid certificates.
+        ctx = ssl.create_default_context(cafile=certifi.where())
         with socket.create_connection((hostname, 443), timeout=DEFAULT_TIMEOUT) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert = ssock.getpeercert()
@@ -301,5 +309,22 @@ def check_links_status(urls: list[str]) -> dict:
             results.append({"url": url, "status_code": resp.status_code, "broken": resp.status_code >= 400})
         except requests.exceptions.RequestException as e:
             results.append({"url": url, "status_code": None, "broken": True, "error": str(e)})
+
     broken_count = sum(1 for r in results if r["broken"])
-    return {"checked": len(results), "broken_count": broken_count, "results": results}
+    broken_fraction = broken_count / len(results) if results else 0
+    warning = None
+    if broken_fraction >= 0.5 and len(results) >= 3:
+        warning = (
+            f"CAUTION: {broken_count}/{len(results)} sampled links failed at once. A failure rate this "
+            f"high on a small sample often indicates the target site is blocking automated requests "
+            f"(bot/WAF protection) rather than the links being genuinely broken. Report this as a "
+            f"possible false positive needing manual verification, not a confirmed critical issue, "
+            f"unless the errors clearly indicate real 404s (e.g. consistent 'page not found' content)."
+        )
+
+    return {
+        "checked": len(results),
+        "broken_count": broken_count,
+        "results": results,
+        "high_failure_rate_warning": warning,
+    }

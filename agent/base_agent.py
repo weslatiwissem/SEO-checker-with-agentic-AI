@@ -108,6 +108,7 @@ class ToolAgent:
         fallback_model: str | None = FALLBACK_MODEL,
         max_iterations: int = MAX_TOOL_ITERATIONS,
         max_output_tokens: int = 2048,
+        starting_key_index: int = 0,
         log_fn: Callable[[str], None] | None = None,
     ):
         self.name = name
@@ -119,7 +120,7 @@ class ToolAgent:
         self.max_output_tokens = max_output_tokens
         self.log = log_fn or (lambda msg: None)
         self._client = None
-        self._key_index = 0
+        self._key_index = starting_key_index % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
         self._original_model = model  # restored when rotating to a fresh API key
         self.tool_call_log: list[dict] = []  # [{"name": ..., "args": ..., "result": ...}] for post-hoc verification
 

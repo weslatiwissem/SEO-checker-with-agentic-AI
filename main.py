@@ -13,12 +13,12 @@ import json
 import sys
 
 from dotenv import load_dotenv
+load_dotenv()  # MUST run before importing agent.* -- agent/config.py reads
+                # env vars (like GROQ_API_KEYS) at import time, not lazily.
 
 from agent import run_full_audit
 from agent import memory
 from agent.report_pdf import export_report_pdf
-
-load_dotenv()
 
 
 def _log(msg: str) -> None:

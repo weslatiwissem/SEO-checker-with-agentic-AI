@@ -74,6 +74,11 @@ report the certificate as expired unless ssl_status_summary explicitly says "CER
 link counts and sample a handful (max 8) of the discovered links with check_links_status to find
 broken links (4xx/5xx). Use fetch_page then parse_seo_elements to discover links, then
 check_links_status on a representative sample (mix of internal and external if possible).
+If check_links_status returns a non-null "high_failure_rate_warning" field, this means many/most
+links failed at once, which often indicates the site is blocking automated requests rather than
+the links being genuinely broken. In that case, report it as a "warning" severity finding noting
+possible bot-blocking and the need for manual verification -- do NOT report it as a confidently
+"critical" broken-links finding, and do not let it drag the score to near-zero.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "competitive": {
@@ -94,7 +99,8 @@ assumptions about "current" thresholds without checking, since these change over
 }
 
 
-def build_specialist(key: str, log_fn=None, model: str | None = None, fallback_model: str | None = FALLBACK_MODEL) -> ToolAgent:
+def build_specialist(key: str, log_fn=None, model: str | None = None,
+                      fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0) -> ToolAgent:
     definition = SPECIALIST_DEFINITIONS[key]
     is_competitive = key == "competitive"
     effective_model = model or (COMPETITIVE_MODEL if is_competitive else DEFAULT_MODEL)
@@ -104,5 +110,6 @@ def build_specialist(key: str, log_fn=None, model: str | None = None, fallback_m
         client_tools=TOOL_GROUPS[key],
         model=effective_model,
         fallback_model=fallback_model,
+        starting_key_index=key_index,
         log_fn=log_fn,
     )
