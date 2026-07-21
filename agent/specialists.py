@@ -94,6 +94,13 @@ the task, incorporate whatever you can find about it into a direct comparison of
 concrete signals (e.g. title length, structured data use).
 Ground every claim in what you actually found via your research -- do not rely on memorized
 assumptions about "current" thresholds without checking, since these change over time.
+
+IMPORTANT: A separate Content Quality specialist already independently measures and judges this
+exact site's title tag length, meta description length, and heading structure -- do NOT re-measure
+or re-judge those same on-page elements yourself, since you do not have access to that specialist's
+actual measured data and restating it independently risks contradicting it. Focus only on: industry
+benchmark research, best-practice thresholds, competitor comparison (if a competitor URL is given),
+and Core Web Vitals / structured-data expectations for this site's niche.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
 }

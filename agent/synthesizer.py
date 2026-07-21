@@ -40,16 +40,19 @@ Respond with ONLY a single JSON object (no prose, no markdown fences) matching e
 }
 
 Do not invent findings not present in the specialist reports. Do not simply average blindly --
-use judgment, but stay grounded in the evidence provided.
+use judgment, but stay grounded in the evidence provided. Each specialist report has a "category"
+field with its exact, fixed name -- use those names VERBATIM as the "name" field for each category
+in your output. Do not rename, rephrase, or invent alternative category names.
 """
 
 
 def run_synthesizer(
     url: str, specialist_reports: dict[str, dict], previous_audit: dict | None,
-    model: str = DEFAULT_MODEL, fallback_model: str | None = FALLBACK_MODEL, log_fn=None
+    model: str = DEFAULT_MODEL, fallback_model: str | None = FALLBACK_MODEL,
+    key_index: int = 0, log_fn=None
 ) -> dict:
     agent = ToolAgent(name="Synthesizer", system_prompt=SYNTHESIZER_SYSTEM_PROMPT, model=model,
-                       fallback_model=fallback_model, max_output_tokens=3500, log_fn=log_fn)
+                       fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index, log_fn=log_fn)
 
     payload = {
         "url": url,

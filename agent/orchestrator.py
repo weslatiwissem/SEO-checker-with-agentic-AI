@@ -44,6 +44,22 @@ MODE_CONFIGS = {
 }
 
 
+# Fixed, canonical category names -- the model's own "category" field in its
+# JSON output is overridden with these rather than trusted, since the
+# competitive specialist in particular renames itself differently almost
+# every run ("SEO Technical Health", "SEO Health Assessment", "SEO Audit"...),
+# which is a major source of the critic's repeated "category doesn't match
+# between specialist report and draft" complaints.
+CANONICAL_CATEGORY_NAMES = {
+    "technical_seo": "Technical SEO",
+    "content": "On-Page Content",
+    "performance": "Page Speed",
+    "security": "Web Security",
+    "links": "Link Health",
+    "competitive": "Competitive & Industry Benchmarking",
+}
+
+
 def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dict, key_index: int, log_fn) -> tuple[str, dict]:
     model = cfg["competitive"] if key == "competitive" else cfg["primary"]
     agent = build_specialist(key, log_fn=log_fn, model=model, fallback_model=cfg["fallback"], key_index=key_index)
@@ -52,6 +68,7 @@ def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dic
         task += f"\nCompetitor URL to compare against: {competitor_url}"
     result = agent.run(task)
     result = reconcile_ssl_findings(result, agent.tool_call_log, log_fn=log_fn)
+    result["category"] = CANONICAL_CATEGORY_NAMES.get(key, result.get("category", key))
     return key, result
 
 
@@ -93,6 +110,16 @@ def _reconcile_overall_score(report: dict, log_fn) -> None:
             "D" if computed_score >= 60 else "F"
         )
 
+    # The score above is already correct regardless of whether weights sum to
+    # 1.0 (we divide by the actual total), but the displayed per-category
+    # weights are still misleading to a reader if they don't sum to 1.0 --
+    # the critic flags this almost every run and it's never actually fixed
+    # upstream, so normalize it here deterministically.
+    if abs(total_weight - 1.0) > 0.02:
+        log_fn(f"  -> Normalizing category weights: they summed to {round(total_weight, 3)}, not 1.0")
+        for c in usable:
+            c["weight"] = round(c["weight"] / total_weight, 3)
+
 
 def run_full_audit(
     url: str,
@@ -109,6 +136,8 @@ def run_full_audit(
     previous_audit = memory.get_last_audit(url) if use_memory else None
 
     log_fn(f"Stage 1/4: Planning audit scope... (mode: {mode})")
+    # Planner only runs once per audit, so it staying on key 0 has low impact
+    # compared to synthesizer/critic, which run repeatedly in Stage 3.
     plan = run_planner(url, competitor_url, has_history=previous_audit is not None,
                         model=cfg["planner"], fallback_model=cfg["fallback"], log_fn=log_fn)
     specialist_keys = [k for k in plan.get("specialists", []) if k in SPECIALIST_DEFINITIONS]
@@ -148,10 +177,15 @@ def run_full_audit(
                 }
 
     log_fn("Stage 3/4: Synthesizing + critiquing report (reflection loop)...")
+    # Continue the same key rotation sequence right after the specialists,
+    # rather than resetting back to key 0 -- synthesizer/critic run multiple
+    # times in this stage and previously always hit whichever key specialist
+    # #0 used, every single time.
+    stage3_start_index = len(specialist_keys) % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
     draft, reflection_log = reflect_and_revise(
         url, specialist_reports, previous_audit,
         synthesizer_model=cfg["primary"], critic_model=cfg["critic"],
-        fallback_model=cfg["fallback"], log_fn=log_fn,
+        fallback_model=cfg["fallback"], starting_key_index=stage3_start_index, log_fn=log_fn,
     )
 
     try:

@@ -39,9 +39,9 @@ valid, complete JSON; being concise matters more than being exhaustive.
 
 
 def critique(draft: dict, specialist_reports: dict, model: str = CRITIC_MODEL,
-             fallback_model: str | None = FALLBACK_MODEL, log_fn=None) -> dict:
+             fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0, log_fn=None) -> dict:
     agent = ToolAgent(name="Critic", system_prompt=CRITIC_SYSTEM_PROMPT, model=model,
-                       fallback_model=fallback_model, max_output_tokens=3500, log_fn=log_fn)
+                       fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index, log_fn=log_fn)
     payload = {"draft_report": draft, "specialist_reports": specialist_reports}
     return agent.run(json.dumps(payload, indent=2))
 
@@ -53,18 +53,28 @@ def reflect_and_revise(
     synthesizer_model: str = DEFAULT_MODEL,
     critic_model: str = CRITIC_MODEL,
     fallback_model: str | None = FALLBACK_MODEL,
+    starting_key_index: int = 0,
     log_fn=None,
 ) -> tuple[dict, list[dict]]:
     """Run synthesizer -> critic -> (revise if needed) up to MAX_REFLECTION_ROUNDS times.
-    Returns (final_report, reflection_log)."""
+    Returns (final_report, reflection_log).
+
+    Synthesizer and critic each run multiple times per audit (once per
+    reflection round), and previously always started on the same API key
+    (index 0) every time -- meaning that key's 70B quota took the full brunt
+    of every sequential call in this stage while other configured keys sat
+    unused here. Each successive call now moves to the next key instead."""
     reflection_log = []
+    key_cycle = starting_key_index
 
     draft = run_synthesizer(url, specialist_reports, previous_audit, model=synthesizer_model,
-                             fallback_model=fallback_model, log_fn=log_fn)
+                             fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn)
+    key_cycle += 1
 
     for round_num in range(1, MAX_REFLECTION_ROUNDS + 1):
         review = critique(draft, specialist_reports, model=critic_model,
-                           fallback_model=fallback_model, log_fn=log_fn)
+                           fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn)
+        key_cycle += 1
         reflection_log.append({"round": round_num, "review": review})
 
         if review.get("approved"):
@@ -81,7 +91,8 @@ def reflect_and_revise(
             "instructions": review.get("instructions_for_revision"),
         }
         draft = run_synthesizer(url, revised_reports, previous_audit, model=synthesizer_model,
-                                 fallback_model=fallback_model, log_fn=log_fn)
+                                 fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn)
+        key_cycle += 1
     else:
         if log_fn:
             log_fn("[Critic] max reflection rounds reached; proceeding with latest draft.")

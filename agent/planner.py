@@ -33,12 +33,13 @@ Respond with ONLY a JSON object (no prose, no markdown fences):
 
 
 def run_planner(url: str, competitor_url: str | None, has_history: bool, model: str = PLANNER_MODEL,
-                 fallback_model: str | None = FALLBACK_MODEL, log_fn=None) -> dict:
+                 fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0, log_fn=None) -> dict:
     agent = ToolAgent(
         name="Planner",
         system_prompt=PLANNER_SYSTEM_PROMPT,
         model=model,
         fallback_model=fallback_model,
+        starting_key_index=key_index,
         log_fn=log_fn,
     )
     context = f"Target URL: {url}"
