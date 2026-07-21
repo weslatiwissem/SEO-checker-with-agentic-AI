@@ -77,3 +77,88 @@ def reconcile_ssl_findings(specialist_result: dict, tool_call_log: list[dict], l
         )
 
     return specialist_result
+
+
+# --- Competitive specialist / on-page overlap ---------------------------
+#
+# The competitive specialist was explicitly instructed not to re-judge title
+# tag / meta description length (that's the Content specialist's exclusive
+# domain), since it doesn't have access to that specialist's actual measured
+# data and independently re-deriving the same fact risks contradicting it
+# (e.g. claiming a 9-character title is "well within 50-60 characters", or
+# claiming a meta description tag is missing when Content already confirmed
+# it exists). That prompt instruction alone did not reliably stop it, so this
+# strips out any such finding deterministically rather than trusting the model.
+
+_ONPAGE_OVERLAP_TOPIC_KEYWORDS = ("title tag", "title length", "title is", "meta description")
+_ONPAGE_OVERLAP_CONTEXT_KEYWORDS = ("character", "length", "within", "recommend", "missing", "lacks", "omission")
+
+
+def _is_onpage_overlap_finding(finding: dict) -> bool:
+    text = (finding.get("issue", "") + " " + finding.get("recommendation", "")).lower()
+    mentions_topic = any(k in text for k in _ONPAGE_OVERLAP_TOPIC_KEYWORDS)
+    mentions_context = any(k in text for k in _ONPAGE_OVERLAP_CONTEXT_KEYWORDS)
+    return mentions_topic and mentions_context
+
+
+def strip_competitive_onpage_overlap(specialist_result: dict, log_fn=None) -> dict:
+    """Remove any competitive-specialist finding that re-judges title tag or
+    meta description length/presence -- that's the Content specialist's job,
+    and the competitive specialist doesn't share its ground-truth data."""
+    findings = specialist_result.get("findings", [])
+    kept = [f for f in findings if not _is_onpage_overlap_finding(f)]
+    removed_count = len(findings) - len(kept)
+
+    specialist_result["findings"] = kept
+
+    if removed_count and log_fn:
+        log_fn(
+            f"  -> Removed {removed_count} duplicate/conflicting on-page finding(s) from "
+            f"'{specialist_result.get('category', '?')}' -- title/meta description length is "
+            f"the Content specialist's domain, not competitive's."
+        )
+
+    return specialist_result
+
+
+# --- Summary text vs. real trend data ------------------------------------
+#
+# The synthesizer sometimes writes a specific point-delta claim in its prose
+# summary ("up 3 points", "improved by 8%") that contradicts the actual,
+# deterministically-computed trend sitting right next to it in the same
+# report -- occasionally even getting the *direction* backwards. Rather than
+# trying to surgically rewrite the model's prose (fragile), append a clear,
+# correct note so the real number is never far from the wrong one.
+
+_UP_WORDS = ("improved", "increase", "up ", "risen", "grew", "gained")
+_DOWN_WORDS = ("decreased", "decline", "down ", "dropped", "fell", "worsened", "regressed")
+
+
+def fix_summary_trend_mismatch(report: dict, log_fn=None) -> None:
+    """If the summary text's claimed trend direction contradicts the actual
+    computed score_delta, append a correcting note rather than trusting the
+    model's restated arithmetic."""
+    trend = report.get("trend")
+    summary = report.get("summary", "")
+    if not trend or not summary:
+        return
+
+    delta = trend.get("score_delta")
+    if delta is None:
+        return
+
+    summary_lower = summary.lower()
+    claims_up = any(w in summary_lower for w in _UP_WORDS)
+    claims_down = any(w in summary_lower for w in _DOWN_WORDS)
+
+    mismatch = (claims_up and delta < 0) or (claims_down and delta > 0)
+    if mismatch:
+        direction = "up" if delta > 0 else ("down" if delta < 0 else "flat")
+        if log_fn:
+            log_fn(f"  -> Summary text's trend claim contradicts the actual score_delta "
+                   f"({delta:+g}); appending a correction.")
+        report["summary"] = (
+            summary.rstrip()
+            + f" (Note: the summary above may have the trend direction wrong -- the actual "
+              f"verified change since the last audit is {direction} {abs(delta):g} points.)"
+        )

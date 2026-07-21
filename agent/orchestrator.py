@@ -18,7 +18,7 @@ from .planner import run_planner
 from .specialists import build_specialist, SPECIALIST_DEFINITIONS
 from .critic import reflect_and_revise
 from .schemas import validate_report, ValidationError
-from .postprocess import reconcile_ssl_findings
+from .postprocess import reconcile_ssl_findings, strip_competitive_onpage_overlap, fix_summary_trend_mismatch
 from .config import (
     MAX_PARALLEL_SPECIALISTS, SPECIALIST_DISPATCH_STAGGER_SECONDS,
     DEFAULT_MODEL, FALLBACK_MODEL, COMPETITIVE_MODEL, PLANNER_MODEL, CRITIC_MODEL, GROQ_API_KEYS,
@@ -68,6 +68,8 @@ def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dic
         task += f"\nCompetitor URL to compare against: {competitor_url}"
     result = agent.run(task)
     result = reconcile_ssl_findings(result, agent.tool_call_log, log_fn=log_fn)
+    if key == "competitive":
+        result = strip_competitive_onpage_overlap(result, log_fn=log_fn)
     result["category"] = CANONICAL_CATEGORY_NAMES.get(key, result.get("category", key))
     return key, result
 
@@ -215,6 +217,7 @@ def run_full_audit(
             "previous_timestamp": previous_audit.get("_timestamp"),
             "score_delta": round(final_report.get("overall_score", 0) - previous_audit.get("overall_score", 0), 1),
         }
+        fix_summary_trend_mismatch(final_report, log_fn)
 
     log_fn("Stage 4/4: Saving to persistent memory...")
     if use_memory:
