@@ -101,7 +101,7 @@ def _reconcile_overall_score(report: dict, log_fn) -> None:
     computed_score = round(weighted_sum / total_weight, 1)
 
     reported_score = report.get("overall_score")
-    if reported_score is None or abs(reported_score - computed_score) > 2:
+    if reported_score is None or abs(reported_score - computed_score) > 0.05:
         log_fn(f"  -> Correcting overall_score: model said {reported_score}, "
                f"actual weighted average is {computed_score}")
         report["overall_score"] = computed_score
