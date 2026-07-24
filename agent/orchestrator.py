@@ -18,7 +18,7 @@ from .planner import run_planner
 from .specialists import build_specialist, SPECIALIST_DEFINITIONS
 from .critic import reflect_and_revise
 from .schemas import validate_report, ValidationError
-from .postprocess import reconcile_ssl_findings, strip_competitive_onpage_overlap, fix_summary_trend_mismatch
+from .postprocess import reconcile_ssl_findings, strip_competitive_onpage_overlap, fix_summary_trend_mismatch, fix_fabricated_trend_claim
 from .config import (
     MAX_PARALLEL_SPECIALISTS, SPECIALIST_DISPATCH_STAGGER_SECONDS,
     DEFAULT_MODEL, FALLBACK_MODEL, COMPETITIVE_MODEL, PLANNER_MODEL, CRITIC_MODEL, GROQ_API_KEYS,
@@ -218,6 +218,8 @@ def run_full_audit(
             "score_delta": round(final_report.get("overall_score", 0) - previous_audit.get("overall_score", 0), 1),
         }
         fix_summary_trend_mismatch(final_report, log_fn)
+    else:
+        fix_fabricated_trend_claim(final_report, log_fn)
 
     log_fn("Stage 4/4: Saving to persistent memory...")
     if use_memory:

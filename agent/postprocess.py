@@ -162,3 +162,42 @@ def fix_summary_trend_mismatch(report: dict, log_fn=None) -> None:
             + f" (Note: the summary above may have the trend direction wrong -- the actual "
               f"verified change since the last audit is {direction} {abs(delta):g} points.)"
         )
+
+
+# --- Fabricated "previous audit" comparisons -----------------------------
+#
+# A distinct, worse failure mode than a mismatched delta: when there is NO
+# real previous audit for a domain at all (first-ever run), the model can
+# still confidently write "compared to the previous audit, score increased
+# by 1 point" -- inventing a comparison out of nothing rather than getting
+# an existing number wrong. fix_summary_trend_mismatch only checks cases
+# where real trend data exists, so this needs its own check.
+
+_PREVIOUS_AUDIT_PHRASES = (
+    "previous audit", "last audit", "prior audit", "earlier audit",
+    "since the last", "compared to the previous", "compared to the last",
+)
+
+
+def fix_fabricated_trend_claim(report: dict, log_fn=None) -> None:
+    """If no real trend data exists (no prior audit for this domain), but the
+    summary still claims a comparison to a previous audit, append a
+    correction rather than leaving a fabricated data point unchallenged."""
+    if report.get("trend"):
+        return  # a real previous audit exists -- fix_summary_trend_mismatch handles that case
+
+    summary = report.get("summary", "")
+    if not summary:
+        return
+
+    summary_lower = summary.lower()
+    if any(phrase in summary_lower for phrase in _PREVIOUS_AUDIT_PHRASES):
+        if log_fn:
+            log_fn("  -> Summary claims a comparison to a previous audit, but no prior audit "
+                   "exists for this domain; appending a correction.")
+        report["summary"] = (
+            summary.rstrip()
+            + " (Note: this is the first recorded audit for this domain -- there is no actual "
+              "previous audit to compare against, so any such comparison above is fabricated "
+              "and should be disregarded.)"
+        )
