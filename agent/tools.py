@@ -28,6 +28,13 @@ DEFAULT_TIMEOUT = 10
 # HTML look it up here instead of receiving it as a function argument.
 _page_cache: dict[str, str] = {}
 
+# Status codes commonly returned by bot/WAF protection (Cloudflare "Are You
+# Human" challenges, rate limiters, etc.) rather than reflecting a genuine
+# site problem. When we see one, the fetched "content" is very likely a
+# block/challenge page, not the real site -- callers should not treat it as
+# representative of the site's actual SEO quality.
+_LIKELY_BLOCK_STATUS_CODES = {401, 403, 429, 503}
+
 
 def normalize_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
@@ -51,7 +58,8 @@ def fetch_page(url: str) -> dict:
         elapsed_ms = round((time.time() - start) * 1000, 1)
         _page_cache[url] = resp.text
         _page_cache[resp.url] = resp.text
-        return {
+
+        result = {
             "ok": True,
             "requested_url": url,
             "final_url": resp.url,
@@ -64,6 +72,19 @@ def fetch_page(url: str) -> dict:
             "note": "HTML fetched and cached server-side. Call parse_seo_elements(url=...) "
                     "with this same url to extract SEO signals -- do not request raw HTML.",
         }
+
+        if resp.status_code in _LIKELY_BLOCK_STATUS_CODES:
+            result["likely_blocked"] = True
+            result["block_warning"] = (
+                f"Status code {resp.status_code} commonly indicates the site is blocking "
+                f"automated requests (bot/WAF/anti-bot protection) rather than reflecting a "
+                f"genuine site problem. The fetched content, if any, is very likely a "
+                f"block/challenge page, NOT the real page. Do NOT score or report on it as if "
+                f"it were the site's actual content -- report a single critical finding noting "
+                f"suspected blocking instead of a normal quality assessment."
+            )
+
+        return result
     except requests.exceptions.RequestException as e:
         return {"ok": False, "requested_url": url, "error": str(e)}
 
@@ -221,9 +242,6 @@ def check_ssl_certificate(domain_or_url: str) -> dict:
         days_until_expiry = None
         summary = "SSL status could not be determined."
         if expires_raw:
-            # e.g. "Aug 18 12:44:57 2026 GMT" -- parse and compare ourselves so
-            # the model never has to reason about date arithmetic (it gets
-            # this wrong, especially smaller models -- compute it here instead).
             expires_dt = datetime.strptime(expires_raw, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             is_expired = expires_dt < now
@@ -242,7 +260,7 @@ def check_ssl_certificate(domain_or_url: str) -> dict:
             "expires": expires_raw,
             "is_expired": is_expired,
             "days_until_expiry": days_until_expiry,
-            "ssl_status_summary": summary,  # READ THIS FIELD -- it's the authoritative, pre-computed answer
+            "ssl_status_summary": summary,
             "subject": dict(x[0] for x in cert.get("subject", [])),
         }
     except Exception as e:
@@ -254,11 +272,9 @@ def analyze_security_headers(headers: dict) -> dict:
     looks_malformed = (
         not isinstance(headers, dict)
         or not headers
-        # a tool-call-shaped wrapper mistakenly passed instead of real headers
         or {"function", "args"}.issubset(headers.keys())
         or {"function", "arguments"}.issubset(headers.keys())
         or "url" in headers
-        # real HTTP headers are always string -> string
         or any(not isinstance(v, str) for v in headers.values())
     )
     if looks_malformed:
@@ -294,7 +310,7 @@ def analyze_security_headers(headers: dict) -> dict:
         "present_headers": present,
         "missing_headers": missing,
         "server_banner": lower_headers.get("server"),
-        "powered_by_banner": lower_headers.get("x-powered-by"),  # leaking tech stack is itself a minor risk
+        "powered_by_banner": lower_headers.get("x-powered-by"),
     }
 
 
