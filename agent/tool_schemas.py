@@ -93,6 +93,22 @@ CHECK_LINKS_STATUS = _tool(
     ["urls"],
 )
 
+CHECK_CORE_WEB_VITALS = _tool(
+    "check_core_web_vitals",
+    (
+        "Run a REAL Lighthouse audit via Google's PageSpeed Insights API -- not a proxy "
+        "signal. Returns actual LCP, CLS, Total Blocking Time (INP proxy), Speed Index, and "
+        "a 0-100 performance score, plus real-world Chrome user data (CrUX) when available. "
+        "Takes 10-30+ seconds since Google runs a real audit server-side. If it fails (ok: "
+        "false), fall back to proxy signals from fetch_page/parse_seo_elements instead."
+    ),
+    {
+        "url": {"type": "string", "description": "The URL to audit"},
+        "strategy": {"type": "string", "description": "\"mobile\" or \"desktop\" (default mobile)"},
+    },
+    ["url"],
+)
+
 # Named groups handed to each specialist agent. The "competitive" specialist
 # intentionally has no client tools -- it runs on Groq's Compound system,
 # which performs web search server-side and does not support custom tools
@@ -100,8 +116,9 @@ CHECK_LINKS_STATUS = _tool(
 TOOL_GROUPS = {
     "technical_seo": [FETCH_PAGE, FETCH_ROBOTS_TXT, FETCH_SITEMAP, CHECK_SSL_CERTIFICATE, PARSE_SEO_ELEMENTS],
     "content": [FETCH_PAGE, PARSE_SEO_ELEMENTS],
-    "performance": [FETCH_PAGE, PARSE_SEO_ELEMENTS],
+    "performance": [FETCH_PAGE, PARSE_SEO_ELEMENTS, CHECK_CORE_WEB_VITALS],
     "security": [FETCH_PAGE, CHECK_SSL_CERTIFICATE, ANALYZE_SECURITY_HEADERS],
     "links": [FETCH_PAGE, PARSE_SEO_ELEMENTS, CHECK_LINKS_STATUS],
     "competitive": [],
 }
+

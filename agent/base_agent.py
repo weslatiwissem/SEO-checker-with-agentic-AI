@@ -26,6 +26,7 @@ TOOL_IMPL: dict[str, Callable[[dict], dict]] = {
     "check_ssl_certificate": lambda args: tools.check_ssl_certificate(args["domain_or_url"]),
     "analyze_security_headers": lambda args: tools.analyze_security_headers(args["headers"]),
     "check_links_status": lambda args: tools.check_links_status(args["urls"]),
+    "check_core_web_vitals": lambda args: tools.check_core_web_vitals(args["url"], args.get("strategy", "mobile")),
 }
 
 # Groq formats wait times as e.g. "11.065s", "6m53.856s", or "1h4m12.576s" --
@@ -282,6 +283,13 @@ class ToolAgent:
                     result = TOOL_IMPL[tc.function.name](args)
                 except Exception as e:
                     result = {"ok": False, "error": f"Tool execution failed: {e}"}
+
+                if tc.function.name == "check_core_web_vitals":
+                    if result.get("ok"):
+                        lab = result.get("lab_data", {})
+                        self.log(f"[{self.name}]    check_core_web_vitals OK: score={lab.get('performance_score_0_100')} lcp={lab.get('lcp_ms')}ms cls={lab.get('cls')}")
+                    else:
+                        self.log(f"[{self.name}]    check_core_web_vitals FAILED: {result.get('error')}")
                 self.tool_call_log.append({"name": tc.function.name, "args": args, "result": result})
                 messages.append(
                     {

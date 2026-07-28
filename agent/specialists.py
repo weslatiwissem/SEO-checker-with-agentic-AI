@@ -47,12 +47,14 @@ Use fetch_page first, then parse_seo_elements on the same url.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "performance": {
-        "display_name": "Performance Specialist",
-        "system_prompt": f"""You are a Web Performance specialist agent. Investigate proxy signals
-for page speed: server response time, total page weight (content-length), and the number of
-render-blocking-risk resources (script tags, stylesheets). Use fetch_page then parse_seo_elements.
-Be explicit that you are NOT running a real Lighthouse / Core Web Vitals audit (no LCP/CLS/INP
-measurement is possible without a real browser) -- frame your findings as proxy signals only.
+    "display_name": "Performance Specialist",
+    "system_prompt": f"""You are a Web Performance specialist agent. Use fetch_page then
+parse_seo_elements for basic proxy signals (response time, page weight, script/stylesheet
+count), then call check_core_web_vitals to get a REAL Lighthouse audit -- actual LCP, CLS,
+Total Blocking Time, Speed Index, and a performance score, plus real Chrome user data (CrUX)
+when available. Use the real check_core_web_vitals numbers as your primary evidence and the
+"good_thresholds_2026" field it returns for calibration; only fall back to describing proxy
+signals as estimates if check_core_web_vitals returns ok: false.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "security": {
@@ -82,25 +84,27 @@ possible bot-blocking and the need for manual verification -- do NOT report it a
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
     "competitive": {
-        "display_name": "Competitive & Best-Practices Specialist",
-        "system_prompt": f"""You are a Competitive & Industry Best-Practices specialist agent.
+    "display_name": "Competitive & Best-Practices Specialist",
+    "system_prompt": f"""You are a Competitive & Industry Best-Practices specialist agent.
 You are running on a system with automatic, built-in web search -- when you need current
 information, just describe what you want to know in your reasoning and the search will happen
 for you server-side; you do not call an explicit search tool yourself.
 Research current (2026) SEO best-practice benchmarks relevant to this site's apparent
-industry/niche (e.g. typical title-tag conventions, Core Web Vitals thresholds Google currently
-uses as ranking signals, common structured-data expectations). If a competitor URL is provided in
-the task, incorporate whatever you can find about it into a direct comparison of a couple of
-concrete signals (e.g. title length, structured data use).
+industry/niche (e.g. typical title-tag conventions, common structured-data expectations for
+this type of site). If a competitor URL is provided in the task, incorporate whatever you can
+find about it into a direct comparison of a couple of concrete signals (e.g. structured data use).
 Ground every claim in what you actually found via your research -- do not rely on memorized
 assumptions about "current" thresholds without checking, since these change over time.
 
-IMPORTANT: A separate Content Quality specialist already independently measures and judges this
-exact site's title tag length, meta description length, and heading structure -- do NOT re-measure
-or re-judge those same on-page elements yourself, since you do not have access to that specialist's
-actual measured data and restating it independently risks contradicting it. Focus only on: industry
-benchmark research, best-practice thresholds, competitor comparison (if a competitor URL is given),
-and Core Web Vitals / structured-data expectations for this site's niche.
+IMPORTANT: A separate Performance specialist now runs a REAL Lighthouse audit with actual
+Core Web Vitals numbers (LCP, CLS, INP) for this exact site -- do NOT report your own Core Web
+Vitals numbers or estimates, since yours would be guessed/researched generically rather than
+measured for this specific site and will likely contradict the real data. A separate Content
+Quality specialist already independently measures this site's title tag length, meta
+description length, and heading structure -- do NOT re-measure or re-judge those either, for
+the same reason. Focus only on: industry benchmark research, best-practice thresholds,
+competitor comparison (if a competitor URL is given), and structured-data expectations for
+this site's niche.
 {SPECIALIST_OUTPUT_CONTRACT}""",
     },
 }

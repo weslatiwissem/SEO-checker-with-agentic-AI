@@ -18,7 +18,12 @@ from .planner import run_planner
 from .specialists import build_specialist, SPECIALIST_DEFINITIONS
 from .critic import reflect_and_revise
 from .schemas import validate_report, ValidationError
-from .postprocess import reconcile_ssl_findings, strip_competitive_onpage_overlap, fix_summary_trend_mismatch, fix_fabricated_trend_claim
+from .postprocess import (
+    reconcile_ssl_findings, strip_competitive_onpage_overlap,
+    fix_summary_trend_mismatch, fix_fabricated_trend_claim,
+    reconcile_likely_blocked, reconcile_core_web_vitals,
+    fix_stale_cwv_data_limitations,
+)
 from .config import (
     MAX_PARALLEL_SPECIALISTS, SPECIALIST_DISPATCH_STAGGER_SECONDS,
     DEFAULT_MODEL, FALLBACK_MODEL, COMPETITIVE_MODEL, PLANNER_MODEL, CRITIC_MODEL, GROQ_API_KEYS,
@@ -67,7 +72,9 @@ def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dic
     if key == "competitive" and competitor_url:
         task += f"\nCompetitor URL to compare against: {competitor_url}"
     result = agent.run(task)
+    result = reconcile_likely_blocked(result, agent.tool_call_log, log_fn=log_fn)
     result = reconcile_ssl_findings(result, agent.tool_call_log, log_fn=log_fn)
+    result = reconcile_core_web_vitals(result, agent.tool_call_log, log_fn=log_fn)  # <-- new
     if key == "competitive":
         result = strip_competitive_onpage_overlap(result, log_fn=log_fn)
     result["category"] = CANONICAL_CATEGORY_NAMES.get(key, result.get("category", key))
@@ -121,6 +128,42 @@ def _reconcile_overall_score(report: dict, log_fn) -> None:
         log_fn(f"  -> Normalizing category weights: they summed to {round(total_weight, 3)}, not 1.0")
         for c in usable:
             c["weight"] = round(c["weight"] / total_weight, 3)
+
+def _recover_or_drop_empty_categories(report: dict, specialist_reports: dict, log_fn) -> None:
+    """A category with zero findings in the synthesized draft doesn't always
+    mean the specialist itself failed -- the synthesizer can silently lose a
+    specialist's real findings while merging (observed: Link Health's
+    specialist successfully checked links and returned findings, but the
+    draft category ended up empty anyway). Try to recover the specialist's
+    original findings first; only drop the category if there's genuinely
+    nothing to show (e.g. the specialist itself failed, like a 413 error).
+    Must run BEFORE _reconcile_overall_score so a truly-empty, dropped
+    category never counts toward the weighted average."""
+    categories = report.get("categories") or []
+    reverse_canonical = {v: k for k, v in CANONICAL_CATEGORY_NAMES.items()}
+    kept = []
+    for c in categories:
+        if c.get("findings"):
+            kept.append(c)
+            continue
+
+        spec_key = reverse_canonical.get(c.get("name"))
+        source = specialist_reports.get(spec_key) if spec_key else None
+
+        if source and source.get("findings"):
+            log_fn(
+                f"  -> '{c.get('name')}' had no findings in the synthesized draft but the "
+                f"original specialist report did -- recovering its real findings instead of dropping."
+            )
+            c["findings"] = source["findings"]
+            if not isinstance(c.get("score"), (int, float)) and isinstance(source.get("score"), (int, float)):
+                c["score"] = source["score"]
+            kept.append(c)
+        else:
+            log_fn(f"  -> Dropping empty category '{c.get('name', '?')}' -- no findings "
+                   f"in draft or original specialist report.")
+
+    report["categories"] = kept
 
 
 def run_full_audit(
@@ -177,7 +220,8 @@ def run_full_audit(
                     "findings": [],
                     "raw_evidence_notes": f"Specialist failed to complete: {e}",
                 }
-
+    had_real_cwv = any(r.get("_real_cwv_available") for r in specialist_reports.values())
+    
     log_fn("Stage 3/4: Synthesizing + critiquing report (reflection loop)...")
     # Continue the same key rotation sequence right after the specialists,
     # rather than resetting back to key 0 -- synthesizer/critic run multiple
@@ -196,7 +240,9 @@ def run_full_audit(
         log_fn(f"  -> WARNING: final report failed schema validation: {e}")
         final_report = draft  # surface the raw draft rather than crashing the whole run
 
+    _recover_or_drop_empty_categories(final_report, specialist_reports, log_fn)   # <-- was _drop_empty_categories(final_report, log_fn)
     _reconcile_overall_score(final_report, log_fn)
+
 
     was_approved = bool(reflection_log) and reflection_log[-1].get("review", {}).get("approved")
     if not was_approved:
@@ -220,6 +266,8 @@ def run_full_audit(
         fix_summary_trend_mismatch(final_report, log_fn)
     else:
         fix_fabricated_trend_claim(final_report, log_fn)
+
+    fix_stale_cwv_data_limitations(final_report, had_real_cwv, log_fn)
 
     log_fn("Stage 4/4: Saving to persistent memory...")
     if use_memory:

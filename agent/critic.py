@@ -63,7 +63,13 @@ def reflect_and_revise(
     reflection round), and previously always started on the same API key
     (index 0) every time -- meaning that key's 70B quota took the full brunt
     of every sequential call in this stage while other configured keys sat
-    unused here. Each successive call now moves to the next key instead."""
+    unused here. Each successive call now moves to the next key instead.
+
+    On the LAST round, if the critic still rejects the draft, we stop there
+    rather than running one more, unreviewed synthesis pass -- that extra
+    call was previously happening silently, wasting an API call and
+    occasionally producing a broken/degenerate draft (e.g. an empty category
+    with a null score) that nothing ever re-checked before it reached the user."""
     reflection_log = []
     key_cycle = starting_key_index
 
@@ -83,6 +89,15 @@ def reflect_and_revise(
         if log_fn:
             log_fn(f"[Critic] round {round_num}: revision requested -- {review.get('issues')}")
 
+        if round_num == MAX_REFLECTION_ROUNDS:
+            # No rounds left to re-review a further revision -- stop here so the
+            # draft we return is exactly the one reflection_log's last entry
+            # describes, rather than a further, unreviewed synthesizer pass.
+            if log_fn:
+                log_fn("[Critic] max reflection rounds reached; proceeding with the "
+                       "last-reviewed draft.")
+            break
+
         # Feed critic's instructions back into a re-run of the synthesizer
         revised_reports = dict(specialist_reports)
         revised_reports["_critic_feedback"] = {
@@ -93,8 +108,5 @@ def reflect_and_revise(
         draft = run_synthesizer(url, revised_reports, previous_audit, model=synthesizer_model,
                                  fallback_model=fallback_model, key_index=key_cycle, log_fn=log_fn)
         key_cycle += 1
-    else:
-        if log_fn:
-            log_fn("[Critic] max reflection rounds reached; proceeding with latest draft.")
 
     return draft, reflection_log

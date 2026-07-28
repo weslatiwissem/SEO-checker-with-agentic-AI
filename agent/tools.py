@@ -314,6 +314,112 @@ def analyze_security_headers(headers: dict) -> dict:
     }
 
 
+PAGESPEED_API_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+
+
+def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
+    """Run a real Lighthouse audit via Google's PageSpeed Insights API and
+    return both lab data (LCP, CLS, INP proxy via TBT, Speed Index,
+    Performance score) and, when available, real-world field data (CrUX --
+    actual Chrome user metrics for this site). This is a genuine Lighthouse
+    audit, not a proxy signal -- can take 10-30+ seconds since Google runs it
+    server-side. Requires network access to googleapis.com.
+
+    Google's own docs note transient 500 "Unable to process request, please
+    wait a while and try again" errors are common for this API, especially
+    on heavier/complex pages -- retried automatically here rather than
+    relying on the model to notice and retry on its own."""
+    import os
+
+    api_key = os.environ.get("GOOGLE_PAGESPEED_API_KEY")
+    params = {"url": normalize_url(url), "strategy": strategy, "category": "performance"}
+    if api_key:
+        params["key"] = api_key
+
+    max_attempts = 3
+    retry_delay_seconds = 6
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(PAGESPEED_API_URL, params=params, timeout=45)
+            if resp.status_code == 200:
+                data = resp.json()
+                break
+
+            last_error = f"PageSpeed Insights API returned {resp.status_code}: {resp.text[:300]}"
+            if resp.status_code in (500, 502, 503, 504) and attempt < max_attempts:
+                time.sleep(retry_delay_seconds)
+                continue
+
+            return {
+                "ok": False,
+                "error": last_error,
+                "note": "Real Core Web Vitals data unavailable this run -- fall back to the "
+                        "proxy signals from fetch_page/parse_seo_elements instead.",
+            }
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last_error = str(e)
+            if attempt < max_attempts:
+                time.sleep(retry_delay_seconds)
+                continue
+            return {
+                "ok": False,
+                "error": last_error,
+                "note": "Real Core Web Vitals data unavailable this run -- fall back to the "
+                        "proxy signals from fetch_page/parse_seo_elements instead.",
+            }
+
+    lighthouse = data.get("lighthouseResult", {})
+    audits = lighthouse.get("audits", {})
+    perf_category = lighthouse.get("categories", {}).get("performance", {})
+
+    def _audit_value(key, field="numericValue"):
+        audit = audits.get(key)
+        return audit.get(field) if audit else None
+
+    lab_data = {
+        "performance_score_0_100": round(perf_category["score"] * 100) if perf_category.get("score") is not None else None,
+        "lcp_ms": _audit_value("largest-contentful-paint"),
+        "cls": _audit_value("cumulative-layout-shift"),
+        "total_blocking_time_ms": _audit_value("total-blocking-time"),  # proxy for INP in lab data
+        "speed_index_ms": _audit_value("speed-index"),
+        "first_contentful_paint_ms": _audit_value("first-contentful-paint"),
+        "time_to_interactive_ms": _audit_value("interactive"),
+    }
+
+    field_data = None
+    loading_experience = data.get("loadingExperience", {})
+    metrics = loading_experience.get("metrics")
+    if metrics:
+        field_data = {
+            "source": "Chrome UX Report (real user data for this site, last 28 days)",
+            "overall_category": loading_experience.get("overall_category"),
+            "lcp_ms_p75": metrics.get("LARGEST_CONTENTFUL_PAINT_MS", {}).get("percentile"),
+            "cls_p75": metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile"),
+            "inp_ms_p75": metrics.get("INTERACTION_TO_NEXT_PAINT", {}).get("percentile"),
+            "fcp_ms_p75": metrics.get("FIRST_CONTENTFUL_PAINT_MS", {}).get("percentile"),
+        }
+
+    # Current (2026) Google "Good" thresholds, for the model to compare against
+    # without having to search for or guess at them.
+    thresholds = {"lcp_ms": 2500, "cls": 0.1, "inp_ms": 200}
+
+    return {
+        "ok": True,
+        "strategy": strategy,
+        "lab_data_note": "From a real Lighthouse run (server-side, this exact moment).",
+        "lab_data": lab_data,
+        "field_data": field_data,
+        "field_data_note": (
+            "Real Chrome User Experience Report data -- only available for sites with enough "
+            "Chrome traffic. None available for this site/URL." if field_data is None else
+            "Real-world data from actual Chrome users visiting this site."
+        ),
+        "good_thresholds_2026": thresholds,
+    }
+
+
 def check_links_status(urls: list[str]) -> dict:
     """HEAD (fallback GET) a small sample of links to find broken ones."""
     results = []
