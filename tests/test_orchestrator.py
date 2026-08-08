@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent import orchestrator
 
 
@@ -220,3 +222,141 @@ class TestRunFullAuditWiring:
         result = orchestrator.run_full_audit("https://example.com", use_memory=True, mode="quick")
         assert result["trend"]["previous_score"] == 70.0
         assert result["trend"]["score_delta"] == 15.0
+
+
+# --------------------------------------------------------------------------
+# Accessibility specialist wiring
+# --------------------------------------------------------------------------
+
+class TestAccessibilitySpecialistWiring:
+    def test_accessibility_has_a_canonical_category_name(self):
+        assert orchestrator.CANONICAL_CATEGORY_NAMES.get("accessibility") == "Accessibility"
+
+    def test_accessibility_is_in_the_fallback_specialist_list(self, monkeypatch):
+        """If the planner fails to return a usable list, run_full_audit falls
+        back to a hardcoded default -- accessibility must be in it, or the
+        new specialist silently never runs when the planner misbehaves."""
+        monkeypatch.setattr(orchestrator.memory, "get_last_audit", lambda url: None)
+        monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report: 1)
+        monkeypatch.setattr(orchestrator, "run_planner", lambda *a, **kw: {"specialists": [], "reasoning": "t"})
+
+        seen_keys = []
+
+        def fake_build_specialist(key, **kw):
+            seen_keys.append(key)
+            agent = MagicMock()
+            agent.run.return_value = {"category": key, "score": 80, "findings": []}
+            agent.tool_call_log = []
+            return agent
+
+        monkeypatch.setattr(orchestrator, "build_specialist", fake_build_specialist)
+        monkeypatch.setattr(orchestrator, "reflect_and_revise", lambda *a, **kw: (
+            {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+             "categories": [], "quick_wins": [], "data_limitations": ""},
+            [{"round": 1, "review": {"approved": True, "issues": [], "instructions_for_revision": ""}}],
+        ))
+
+        orchestrator.run_full_audit("https://example.com", use_memory=True, mode="quick")
+        assert "accessibility" in seen_keys
+
+
+# --------------------------------------------------------------------------
+# _drop_issues_resolved_by_reconciliation
+# --------------------------------------------------------------------------
+
+class TestDropIssuesResolvedByReconciliation:
+    def test_drops_weight_sum_complaint(self):
+        issues = ["The weights of the categories do not sum to approximately 1.0."]
+        assert orchestrator._drop_issues_resolved_by_reconciliation(issues) == []
+
+    def test_drops_weight_sum_complaint_regardless_of_exact_wording(self):
+        issues = ["Category weights don't sum to 1.0, which is a problem."]
+        assert orchestrator._drop_issues_resolved_by_reconciliation(issues) == []
+
+    def test_keeps_substantive_score_calibration_complaints(self):
+        issues = ["The overall score does not accurately reflect the severity of critical findings."]
+        assert orchestrator._drop_issues_resolved_by_reconciliation(issues) == issues
+
+    def test_keeps_unrelated_issues_and_drops_only_weight_sum_one(self):
+        issues = [
+            "The weights of the categories do not sum to approximately 1.0.",
+            "Some recommendations are vague and non-actionable.",
+        ]
+        result = orchestrator._drop_issues_resolved_by_reconciliation(issues)
+        assert result == ["Some recommendations are vague and non-actionable."]
+
+    def test_empty_list_stays_empty(self):
+        assert orchestrator._drop_issues_resolved_by_reconciliation([]) == []
+
+    def test_end_to_end_final_report_never_shows_stale_weight_complaint(self, monkeypatch):
+        """The exact scenario observed in the wild: critic's last review
+        complains weights don't sum to 1.0, but by the time the final
+        report is built, _reconcile_overall_score has already normalized
+        them -- the stale complaint must not appear in the printed
+        unresolved_review_issues."""
+        monkeypatch.setattr(orchestrator.memory, "get_last_audit", lambda url: None)
+        monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report: 1)
+        monkeypatch.setattr(orchestrator, "run_planner", lambda *a, **kw: {"specialists": ["technical_seo"], "reasoning": "t"})
+
+        fake_agent = MagicMock()
+        fake_agent.run.return_value = {"category": "Technical SEO", "score": 70, "findings": [
+            {"severity": "warning", "issue": "Some issue.", "recommendation": "Fix it."},
+        ]}
+        fake_agent.tool_call_log = []
+        monkeypatch.setattr(orchestrator, "build_specialist", lambda *a, **kw: fake_agent)
+
+        # Draft's weights intentionally don't sum to 1.0 -- _reconcile_overall_score
+        # will normalize them before the report is returned.
+        fake_draft = {
+            "url": "https://example.com", "overall_score": 70.0, "grade": "C",
+            "summary": "s",
+            "categories": [{"name": "Technical SEO", "score": 70.0, "weight": 0.6, "findings": [
+                {"severity": "warning", "issue": "Some issue.", "recommendation": "Fix it."},
+            ]}],
+            "quick_wins": [], "data_limitations": "",
+        }
+        monkeypatch.setattr(orchestrator, "reflect_and_revise", lambda *a, **kw: (
+            dict(fake_draft), [{"round": 1, "review": {
+                "approved": False,
+                "issues": ["The weights of the categories do not sum to approximately 1.0.", "Vague recommendations."],
+                "instructions_for_revision": "...",
+            }}],
+        ))
+
+        result = orchestrator.run_full_audit("https://example.com", use_memory=True, mode="quick")
+        assert result["review_status"] == "not_approved"
+        assert result["unresolved_review_issues"] == ["Vague recommendations."]
+        assert sum(c["weight"] for c in result["categories"]) == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------
+# Best Practices specialist wiring
+# --------------------------------------------------------------------------
+
+class TestBestPracticesSpecialistWiring:
+    def test_best_practices_has_a_canonical_category_name(self):
+        assert orchestrator.CANONICAL_CATEGORY_NAMES.get("best_practices") == "Best Practices"
+
+    def test_best_practices_is_in_the_fallback_specialist_list(self, monkeypatch):
+        monkeypatch.setattr(orchestrator.memory, "get_last_audit", lambda url: None)
+        monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report: 1)
+        monkeypatch.setattr(orchestrator, "run_planner", lambda *a, **kw: {"specialists": [], "reasoning": "t"})
+
+        seen_keys = []
+
+        def fake_build_specialist(key, **kw):
+            seen_keys.append(key)
+            agent = MagicMock()
+            agent.run.return_value = {"category": key, "score": 80, "findings": []}
+            agent.tool_call_log = []
+            return agent
+
+        monkeypatch.setattr(orchestrator, "build_specialist", fake_build_specialist)
+        monkeypatch.setattr(orchestrator, "reflect_and_revise", lambda *a, **kw: (
+            {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+             "categories": [], "quick_wins": [], "data_limitations": ""},
+            [{"round": 1, "review": {"approved": True, "issues": [], "instructions_for_revision": ""}}],
+        ))
+
+        orchestrator.run_full_audit("https://example.com", use_memory=True, mode="quick")
+        assert "best_practices" in seen_keys

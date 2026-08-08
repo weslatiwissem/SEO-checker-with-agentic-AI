@@ -342,6 +342,231 @@ def reconcile_core_web_vitals(specialist_result: dict, tool_call_log: list[dict]
     return specialist_result
 
 
+# --- Real accessibility audit data actually being used --------------------
+#
+# Same failure mode as Core Web Vitals: check_accessibility_and_best_practices
+# runs a genuine Lighthouse accessibility audit, but a model can still write
+# vague findings ("could improve accessibility") instead of citing the real
+# score and the specific failing checks -- inject a canonical finding built
+# directly from the tool result if the model's own findings don't cite it.
+#
+# NOTE: this must check *topic* overlap, not just whether the literal score
+# number appears in the text, AND that overlap check needs to tolerate
+# normal English variation (plurals, word order), not just exact substrings.
+# Observed in the wild, twice, in two different ways:
+#   1. The model wrote four findings clearly sourced from this exact tool
+#      call but never spelled out the score number -- a literal-digit-only
+#      check treated that as "no real data cited" and appended a duplicate.
+#   2. The model wrote "required child roles" for an audit whose id/title
+#      say "required children", and "List items not contained within..."
+#      for an audit id "listitem" (one fused word) -- exact-substring
+#      matching missed both as "not covered" and injected duplicates of
+#      findings that were, in substance, already there.
+# The matcher below stems words (including the "children"/"child" irregular
+# case) and requires only a majority-of-keywords overlap, using both the
+# audit's id AND its human-readable title as the keyword source, so
+# ordinary rewording no longer produces a false "not covered".
+
+# --- Real Lighthouse audit data (accessibility / best practices) actually
+#     being used -----------------------------------------------------------
+#
+# Same failure mode as Core Web Vitals: check_accessibility_and_best_practices
+# and check_best_practices run genuine Lighthouse audits, but a model can
+# still write vague findings ("could improve accessibility") instead of
+# citing the real score and the specific failing checks -- inject a
+# canonical finding built directly from the tool result if the model's own
+# findings don't cite it.
+#
+# NOTE: this must check *topic* overlap, not just whether the literal score
+# number appears in the text, AND that overlap check needs to tolerate
+# normal English variation (plurals, word order), not just exact substrings.
+# Observed in the wild, twice, in two different ways (both against the
+# accessibility audit, but the same matcher is shared with best-practices
+# below since the failure mode is generic to "any Lighthouse audit list"):
+#   1. The model wrote four findings clearly sourced from this exact tool
+#      call but never spelled out the score number -- a literal-digit-only
+#      check treated that as "no real data cited" and appended a duplicate.
+#   2. The model wrote "required child roles" for an audit whose id/title
+#      say "required children", and "List items not contained within..."
+#      for an audit id "listitem" (one fused word) -- exact-substring
+#      matching missed both as "not covered" and injected duplicates of
+#      findings that were, in substance, already there.
+# The matcher below stems words (including the "children"/"child" irregular
+# case) and requires only a majority-of-keywords overlap, using both the
+# audit's id AND its human-readable title as the keyword source, so
+# ordinary rewording no longer produces a false "not covered".
+
+_LIGHTHOUSE_AUDIT_STOPWORDS = {
+    "with", "that", "some", "those", "this", "have", "has", "are", "not",
+    "the", "and", "for", "within", "which", "their", "does", "will",
+}
+_LIGHTHOUSE_AUDIT_IRREGULAR_STEMS = {"children": "child"}
+
+
+def _lighthouse_stem(word: str) -> str:
+    w = word.lower()
+    if w in _LIGHTHOUSE_AUDIT_IRREGULAR_STEMS:
+        return _LIGHTHOUSE_AUDIT_IRREGULAR_STEMS[w]
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    if w.endswith("es") and len(w) > 4:
+        return w[:-2]
+    if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+        return w[:-1]
+    return w
+
+
+def _lighthouse_tokenize(text: str) -> set[str]:
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    return {_lighthouse_stem(w) for w in words if len(w) >= 3}
+
+
+def _latest_tool_result(tool_call_log: list[dict], tool_name: str) -> dict | None:
+    for entry in reversed(tool_call_log):
+        if entry.get("name") == tool_name:
+            result = entry.get("result") or {}
+            if result.get("ok"):
+                return result
+    return None
+
+
+def _lighthouse_audit_topic_already_covered(audit: dict, findings_tokens: set[str]) -> bool:
+    """True if the model's findings already substantively reference this
+    specific failing Lighthouse audit -- judged by stemmed-keyword overlap
+    (from both the audit's id and its human-readable title) against the
+    model's own findings text, rather than requiring an exact substring
+    match. A majority of the audit's significant keywords being present is
+    treated as "covered"; ordinary rewording (plurals, word order,
+    "children" vs "child") no longer produces a false "not covered"."""
+    id_words = re.split(r"[-_]", audit.get("id", ""))
+    title_words = re.findall(r"[a-zA-Z]+", audit.get("title", ""))
+    candidates = [w for w in id_words + title_words if len(w) >= 4 and w.lower() not in _LIGHTHOUSE_AUDIT_STOPWORDS]
+    keywords = {_lighthouse_stem(w) for w in candidates}
+    if not keywords:
+        return False
+
+    matched = sum(1 for k in keywords if k in findings_tokens)
+    threshold = max(1, (len(keywords) + 1) // 2)  # majority, rounded up
+    return matched >= threshold
+
+
+def _mentions_score(findings_text: str, score) -> bool:
+    """True if the findings text cites this exact score number in a way
+    that plausibly means "the score", not just any nearby digit. A raw
+    substring check is too loose -- observed in the wild (well, in a
+    combined-findings scenario): a score of 50 was treated as "already
+    cited" because the digits "50" happened to appear inside an unrelated
+    "30-50% of real WCAG issues" caveat elsewhere in the text. Requiring
+    the number not be immediately adjacent to another digit or a '%' sign
+    rules out both "150" containing "50" and "30-50%" ranges/percentages
+    while still matching ordinary phrasing like "score: 50/100" or "a 50
+    out of 100"."""
+    if score is None:
+        return False
+    pattern = rf"(?<!\d){re.escape(str(round(score)))}(?!\d)(?!%)"
+    return re.search(pattern, findings_text) is not None
+
+
+def _reconcile_lighthouse_category_data(
+    specialist_result: dict, tool_call_log: list[dict], *,
+    tool_name: str, score_field: str, failing_audits_field: str,
+    category_label: str, availability_flag: str, floor_note: str, log_fn=None,
+) -> dict:
+    """Shared implementation behind reconcile_accessibility_data and
+    reconcile_best_practices_data -- both categories have the identical
+    shape of failure mode and identical fix, so this is the one place that
+    logic lives (rather than two copies that could drift out of sync, the
+    way the accessibility-only version already had two real bugs fixed in
+    it)."""
+    tool_result = _latest_tool_result(tool_call_log, tool_name)
+    if tool_result is None:
+        return specialist_result
+
+    score = tool_result.get(score_field)
+    findings = specialist_result.get("findings", [])
+    findings_text = " ".join(
+        f"{f.get('issue', '')} {f.get('recommendation', '')}" for f in findings
+    ).lower()
+    findings_tokens = _lighthouse_tokenize(findings_text)
+
+    mentions_real_score = _mentions_score(findings_text, score)
+    failing = tool_result.get(failing_audits_field, [])
+    uncovered = [a for a in failing if not _lighthouse_audit_topic_already_covered(a, findings_tokens)]
+
+    if mentions_real_score:
+        return specialist_result  # explicitly grounded already, nothing to force
+    if failing and not uncovered:
+        return specialist_result  # every failing check is already substantively covered
+
+    severity = "critical" if (score is not None and score < 50) else (
+        "warning" if (score is not None and score < 90) else "good"
+    )
+
+    if uncovered:
+        examples = "; ".join(a.get("title", a.get("id", "?")) for a in uncovered[:5])
+        issue = f"Real Lighthouse {category_label} score: {score}/100. Failing checks include: {examples}."
+        recommendation = (
+            f"Fix the specific failing checks above first (highest-impact, most concrete). {floor_note}"
+        )
+    else:
+        issue = f"Real Lighthouse {category_label} score: {score}/100. No automated check failures detected."
+        recommendation = f"No action required for automated checks. {floor_note}"
+
+    canonical = {"severity": severity, "issue": issue, "recommendation": recommendation}
+    findings.append(canonical)
+    specialist_result["findings"] = findings
+    specialist_result[availability_flag] = True
+
+    if log_fn:
+        log_fn(
+            f"  -> Injected real {category_label} audit data into "
+            f"'{specialist_result.get('category', '?')}' since the model's findings "
+            f"didn't cite the actual measured score."
+        )
+
+    return specialist_result
+
+
+def reconcile_accessibility_data(specialist_result: dict, tool_call_log: list[dict], log_fn=None) -> dict:
+    """No-op if check_accessibility_and_best_practices wasn't called or
+    failed, or if the model's findings already substantively reflect the
+    real audit data (whether or not they spell out the exact score number).
+    Otherwise append a canonical finding built from the actual audit data
+    -- limited to whichever specific failing checks the model didn't
+    already cover, so a partially-grounded response gets topped up rather
+    than duplicated."""
+    return _reconcile_lighthouse_category_data(
+        specialist_result, tool_call_log,
+        tool_name="check_accessibility_and_best_practices",
+        score_field="accessibility_score_0_100",
+        failing_audits_field="failing_accessibility_audits",
+        category_label="accessibility",
+        availability_flag="_real_accessibility_available",
+        floor_note=(
+            "Automated checks like this catch roughly 30-50% of real WCAG issues, so also "
+            "consider manual or assistive-tech (screen reader) testing beyond this list."
+        ),
+        log_fn=log_fn,
+    )
+
+
+def reconcile_best_practices_data(specialist_result: dict, tool_call_log: list[dict], log_fn=None) -> dict:
+    """Same mechanism as reconcile_accessibility_data, for the Best
+    Practices category: no-op if check_best_practices wasn't called/failed
+    or the model already substantively covered the real failing checks;
+    otherwise tops up whatever it missed."""
+    return _reconcile_lighthouse_category_data(
+        specialist_result, tool_call_log,
+        tool_name="check_best_practices",
+        score_field="best_practices_score_0_100",
+        failing_audits_field="failing_best_practices_audits",
+        category_label="Best Practices",
+        availability_flag="_real_best_practices_available",
+        floor_note="These are automated checks -- always worth a manual spot-check too.",
+        log_fn=log_fn,
+    )
+
+
 _STALE_NO_CWV_PHRASES = ("no real core web vitals", "no core web vitals", "not include real core web vitals")
 
 

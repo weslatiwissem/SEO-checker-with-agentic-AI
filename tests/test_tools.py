@@ -256,6 +256,9 @@ class TestCheckSslCertificate:
 
 
 class TestCheckCoreWebVitals:
+    def setup_method(self):
+        tools._lighthouse_cache.clear()
+
     LIGHTHOUSE_PAYLOAD = {
         "lighthouseResult": {
             "categories": {"performance": {"score": 0.42}},
@@ -306,6 +309,121 @@ class TestCheckCoreWebVitals:
         assert result["ok"] is False
         assert mock_get.call_count == 1  # no retry on a non-5xx failure
 
+    def test_second_call_for_same_url_uses_cache_not_a_new_request(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = self.LIGHTHOUSE_PAYLOAD
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            tools.check_core_web_vitals("example.com")
+            tools.check_core_web_vitals("example.com")
+        assert mock_get.call_count == 1
+
+    def test_different_strategy_is_not_cached_together(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = self.LIGHTHOUSE_PAYLOAD
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            tools.check_core_web_vitals("example.com", strategy="mobile")
+            tools.check_core_web_vitals("example.com", strategy="desktop")
+        assert mock_get.call_count == 2
+
+    def test_failed_call_is_not_cached_so_a_later_call_retries(self):
+        bad = MagicMock(status_code=500, text="server error")
+        good = MagicMock(status_code=200)
+        good.json.return_value = self.LIGHTHOUSE_PAYLOAD
+        with patch.object(tools.time, "sleep", return_value=None):
+            with patch.object(tools.requests, "get", return_value=bad):
+                first = tools.check_core_web_vitals("example.com")
+            assert first["ok"] is False
+            with patch.object(tools.requests, "get", return_value=good):
+                second = tools.check_core_web_vitals("example.com")
+            assert second["ok"] is True
+
+
+class TestCheckAccessibilityAndBestPractices:
+    def setup_method(self):
+        tools._lighthouse_cache.clear()
+
+    LIGHTHOUSE_PAYLOAD = {
+        "lighthouseResult": {
+            "categories": {
+                "accessibility": {
+                    "score": 0.71,
+                    "auditRefs": [
+                        {"id": "color-contrast"},
+                        {"id": "image-alt"},
+                        {"id": "label"},
+                        {"id": "document-title"},
+                    ],
+                },
+            },
+            "audits": {
+                "color-contrast": {"score": 0, "title": "Background/foreground colors have insufficient contrast", "description": "Low-contrast text is hard to read for many users."},
+                "image-alt": {"score": 0, "title": "Image elements do not have [alt] attributes", "description": "Screen readers rely on alt text."},
+                "label": {"score": 1, "title": "Form elements have associated labels", "description": "Labels help assistive tech."},
+                "document-title": {"score": None, "title": "Document has a <title> element", "description": "Informative, not scored."},
+            },
+        },
+    }
+
+    def test_extracts_score_and_failing_audits_only(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = self.LIGHTHOUSE_PAYLOAD
+        with patch.object(tools.requests, "get", return_value=resp):
+            result = tools.check_accessibility_and_best_practices("example.com")
+        assert result["ok"] is True
+        assert result["accessibility_score_0_100"] == 71
+        failing_ids = {a["id"] for a in result["failing_accessibility_audits"]}
+        assert failing_ids == {"color-contrast", "image-alt"}  # score==1 and score==None excluded
+
+    def test_caps_failing_audits_at_twelve(self):
+        many_refs = [{"id": f"check-{i}"} for i in range(20)]
+        many_audits = {f"check-{i}": {"score": 0, "title": f"Check {i}", "description": ""} for i in range(20)}
+        payload = {"lighthouseResult": {"categories": {"accessibility": {"score": 0.1, "auditRefs": many_refs}}, "audits": many_audits}}
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = payload
+        with patch.object(tools.requests, "get", return_value=resp):
+            result = tools.check_accessibility_and_best_practices("example.com")
+        assert len(result["failing_accessibility_audits"]) == 12
+
+    def test_ok_false_on_api_failure(self):
+        bad = MagicMock(status_code=500, text="server error")
+        with patch.object(tools.requests, "get", return_value=bad), \
+             patch.object(tools.time, "sleep", return_value=None):
+            result = tools.check_accessibility_and_best_practices("example.com")
+        assert result["ok"] is False
+
+    def test_missing_accessibility_category_gives_none_score_not_crash(self):
+        payload = {"lighthouseResult": {"categories": {}, "audits": {}}}
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = payload
+        with patch.object(tools.requests, "get", return_value=resp):
+            result = tools.check_accessibility_and_best_practices("example.com")
+        assert result["ok"] is True
+        assert result["accessibility_score_0_100"] is None
+        assert result["failing_accessibility_audits"] == []
+
+    def test_shares_cache_with_check_core_web_vitals(self):
+        """The whole point of sharing the cache: calling both tools for the
+        same url+strategy should cost exactly one PageSpeed API request."""
+        payload = {
+            "lighthouseResult": {
+                "categories": {
+                    "performance": {"score": 0.9},
+                    "accessibility": {"score": 0.8, "auditRefs": []},
+                },
+                "audits": {},
+            },
+            "loadingExperience": {},
+        }
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = payload
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            perf = tools.check_core_web_vitals("example.com")
+            a11y = tools.check_accessibility_and_best_practices("example.com")
+        assert mock_get.call_count == 1
+        assert perf["ok"] is True
+        assert a11y["ok"] is True
+        assert a11y["accessibility_score_0_100"] == 80
+
 
 class TestFetchRobotsAndSitemap:
     def test_fetch_robots_txt_detects_sitemap_reference(self):
@@ -334,3 +452,92 @@ class TestFetchRobotsAndSitemap:
         with patch.object(tools.requests, "get", return_value=resp):
             result = tools.fetch_sitemap("example.com")
         assert result["exists"] is False
+
+
+class TestCheckBestPractices:
+    def setup_method(self):
+        tools._lighthouse_cache.clear()
+
+    LIGHTHOUSE_PAYLOAD = {
+        "lighthouseResult": {
+            "categories": {
+                "best-practices": {
+                    "score": 0.67,
+                    "auditRefs": [
+                        {"id": "is-on-https"},
+                        {"id": "no-vulnerable-libraries"},
+                        {"id": "deprecations"},
+                        {"id": "charset"},
+                    ],
+                },
+            },
+            "audits": {
+                "is-on-https": {"score": 0, "title": "Does not use HTTPS", "description": "..."},
+                "no-vulnerable-libraries": {"score": 0, "title": "Includes front-end JavaScript libraries with known security vulnerabilities", "description": "..."},
+                "deprecations": {"score": 0, "title": "Uses deprecated APIs", "description": "..."},
+                "charset": {"score": 1, "title": "Properly defines charset", "description": "..."},
+            },
+        },
+    }
+
+    def test_extracts_score_and_failing_audits(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = self.LIGHTHOUSE_PAYLOAD
+        with patch.object(tools.requests, "get", return_value=resp):
+            result = tools.check_best_practices("example.com")
+        assert result["ok"] is True
+        assert result["best_practices_score_0_100"] == 67
+        ids = {a["id"] for a in result["failing_best_practices_audits"]}
+        assert ids == {"no-vulnerable-libraries", "deprecations"}  # is-on-https excluded, charset passed
+
+    def test_excludes_https_related_audits_even_when_failing(self):
+        """is-on-https is Security's domain (dedicated SSL check), not
+        Best Practices' -- must never appear here, even if Lighthouse
+        itself reports it as a failure, to avoid contradicting the
+        Security specialist's more authoritative SSL check."""
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = self.LIGHTHOUSE_PAYLOAD
+        with patch.object(tools.requests, "get", return_value=resp):
+            result = tools.check_best_practices("example.com")
+        ids = {a["id"] for a in result["failing_best_practices_audits"]}
+        assert "is-on-https" not in ids
+        assert "redirects-http" not in ids
+
+    def test_ok_false_on_api_failure(self):
+        bad = MagicMock(status_code=500, text="server error")
+        with patch.object(tools.requests, "get", return_value=bad), \
+             patch.object(tools.time, "sleep", return_value=None):
+            result = tools.check_best_practices("example.com")
+        assert result["ok"] is False
+
+    def test_shares_cache_with_accessibility_and_cwv(self):
+        """All three Lighthouse-backed tools should share one API call for
+        the same url+strategy."""
+        payload = {
+            "lighthouseResult": {
+                "categories": {
+                    "performance": {"score": 0.9},
+                    "accessibility": {"score": 0.8, "auditRefs": []},
+                    "best-practices": {"score": 0.7, "auditRefs": []},
+                },
+                "audits": {},
+            },
+            "loadingExperience": {},
+        }
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = payload
+        with patch.object(tools.requests, "get", return_value=resp) as mock_get:
+            tools.check_core_web_vitals("example.com")
+            tools.check_accessibility_and_best_practices("example.com")
+            tools.check_best_practices("example.com")
+        assert mock_get.call_count == 1
+
+    def test_caps_failing_audits_at_twelve(self):
+        many_refs = [{"id": f"check-{i}"} for i in range(20)]
+        many_audits = {f"check-{i}": {"score": 0, "title": f"Check {i}", "description": ""} for i in range(20)}
+        payload = {"lighthouseResult": {"categories": {"best-practices": {"score": 0.1, "auditRefs": many_refs}}, "audits": many_audits}}
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = payload
+        with patch.object(tools.requests, "get", return_value=resp):
+            result = tools.check_best_practices("example.com")
+        assert len(result["failing_best_practices_audits"]) == 12

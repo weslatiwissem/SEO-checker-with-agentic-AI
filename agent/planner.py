@@ -19,10 +19,11 @@ specialist agents should run for this audit.
 Available specialists:
 {_SPECIALIST_LIST}
 
-Normally run all of technical_seo, content, performance, security, and links -- they are cheap
-and each covers a distinct category. Only include "competitive" if it would add real value
-(e.g. a competitor URL was provided, or the site appears to be commercial/public-facing where
-industry benchmarking is meaningful). Skip it for things like localhost/staging/internal URLs.
+Normally run all of technical_seo, content, performance, security, links, accessibility, and
+best_practices -- they are cheap and each covers a distinct category. Only include "competitive"
+if it would add real value (e.g. a competitor URL was provided, or the site appears to be
+commercial/public-facing where industry benchmarking is meaningful). Skip it for things like
+localhost/staging/internal URLs.
 
 Respond with ONLY a JSON object (no prose, no markdown fences):
 {{

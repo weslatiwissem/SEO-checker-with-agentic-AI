@@ -316,14 +316,27 @@ def analyze_security_headers(headers: dict) -> dict:
 
 PAGESPEED_API_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
+# Server-side cache for full PageSpeed Insights/Lighthouse responses, keyed by
+# (normalized_url, strategy). Google's API accepts multiple &category=
+# params in a single request, so check_core_web_vitals and
+# check_accessibility_and_best_practices both request all four categories
+# (performance, accessibility, best-practices, seo) and share one cached
+# response instead of each specialist paying for its own PSI call --
+# whichever tool runs first for a given url+strategy fetches it, the other
+# reads the cache. Not thread-safe against a rare double-fetch race if two
+# specialists hit this in the same instant, but that only costs one extra
+# API call, never a crash.
+_lighthouse_cache: dict[tuple[str, str], dict] = {}
 
-def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
-    """Run a real Lighthouse audit via Google's PageSpeed Insights API and
-    return both lab data (LCP, CLS, INP proxy via TBT, Speed Index,
-    Performance score) and, when available, real-world field data (CrUX --
-    actual Chrome user metrics for this site). This is a genuine Lighthouse
-    audit, not a proxy signal -- can take 10-30+ seconds since Google runs it
-    server-side. Requires network access to googleapis.com.
+_ALL_LIGHTHOUSE_CATEGORIES = ["performance", "accessibility", "best-practices", "seo"]
+
+
+def _fetch_lighthouse(url: str, strategy: str, categories: list[str]) -> dict:
+    """Call the PageSpeed Insights API for the given Lighthouse categories,
+    retrying transient 5xx errors. Returns {"ok": True, "data": <raw PSI
+    JSON>} on success, or {"ok": False, "error": ...} on failure. Callers
+    are responsible for caching -- failures are never cached so a later
+    retry can succeed.
 
     Google's own docs note transient 500 "Unable to process request, please
     wait a while and try again" errors are common for this API, especially
@@ -332,9 +345,11 @@ def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
     import os
 
     api_key = os.environ.get("GOOGLE_PAGESPEED_API_KEY")
-    params = {"url": normalize_url(url), "strategy": strategy, "category": "performance"}
+    params = [("url", normalize_url(url)), ("strategy", strategy)]
+    for category in categories:
+        params.append(("category", category))
     if api_key:
-        params["key"] = api_key
+        params.append(("key", api_key))
 
     max_attempts = 3
     retry_delay_seconds = 6
@@ -344,31 +359,56 @@ def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
         try:
             resp = requests.get(PAGESPEED_API_URL, params=params, timeout=45)
             if resp.status_code == 200:
-                data = resp.json()
-                break
+                return {"ok": True, "data": resp.json()}
 
             last_error = f"PageSpeed Insights API returned {resp.status_code}: {resp.text[:300]}"
             if resp.status_code in (500, 502, 503, 504) and attempt < max_attempts:
                 time.sleep(retry_delay_seconds)
                 continue
-
-            return {
-                "ok": False,
-                "error": last_error,
-                "note": "Real Core Web Vitals data unavailable this run -- fall back to the "
-                        "proxy signals from fetch_page/parse_seo_elements instead.",
-            }
+            return {"ok": False, "error": last_error}
         except (requests.exceptions.RequestException, ValueError) as e:
             last_error = str(e)
             if attempt < max_attempts:
                 time.sleep(retry_delay_seconds)
                 continue
-            return {
-                "ok": False,
-                "error": last_error,
-                "note": "Real Core Web Vitals data unavailable this run -- fall back to the "
-                        "proxy signals from fetch_page/parse_seo_elements instead.",
-            }
+            return {"ok": False, "error": last_error}
+
+    return {"ok": False, "error": last_error}
+
+
+def _get_lighthouse_data(url: str, strategy: str) -> dict | None:
+    """Return the cached full-Lighthouse-run PSI response for this
+    url+strategy, fetching (and caching on success only) if not already
+    present. Returns None on failure -- callers build their own
+    tool-specific error response in that case."""
+    cache_key = (normalize_url(url), strategy)
+    cached = _lighthouse_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    fetched = _fetch_lighthouse(url, strategy, _ALL_LIGHTHOUSE_CATEGORIES)
+    if not fetched.get("ok"):
+        return None
+
+    _lighthouse_cache[cache_key] = fetched["data"]
+    return fetched["data"]
+
+
+def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
+    """Run a real Lighthouse audit via Google's PageSpeed Insights API and
+    return both lab data (LCP, CLS, INP proxy via TBT, Speed Index,
+    Performance score) and, when available, real-world field data (CrUX --
+    actual Chrome user metrics for this site). This is a genuine Lighthouse
+    audit, not a proxy signal -- can take 10-30+ seconds since Google runs it
+    server-side. Requires network access to googleapis.com."""
+    data = _get_lighthouse_data(url, strategy)
+    if data is None:
+        return {
+            "ok": False,
+            "error": "PageSpeed Insights API call failed (see logs for the underlying error).",
+            "note": "Real Core Web Vitals data unavailable this run -- fall back to the "
+                    "proxy signals from fetch_page/parse_seo_elements instead.",
+        }
 
     lighthouse = data.get("lighthouseResult", {})
     audits = lighthouse.get("audits", {})
@@ -417,6 +457,118 @@ def check_core_web_vitals(url: str, strategy: str = "mobile") -> dict:
             "Real-world data from actual Chrome users visiting this site."
         ),
         "good_thresholds_2026": thresholds,
+    }
+
+
+def _extract_category_score_and_failures(data: dict, category_key: str, exclude_audit_ids: set[str] | None = None) -> tuple[int | None, list[dict]]:
+    """Shared extraction logic for any Lighthouse category: returns
+    (0-100 score, [failing audits]). A failing audit is one Lighthouse
+    scored 0 (pass/fail check that failed) -- audits scored None are
+    informative/non-scored and excluded, same as audits scored 1 (passed).
+    exclude_audit_ids lets a caller deterministically drop specific audits
+    that belong to another specialist's domain (e.g. "is-on-https" belongs
+    to the Security specialist, not Best Practices) rather than relying on
+    a prompt instruction to ignore them."""
+    exclude_audit_ids = exclude_audit_ids or set()
+    lighthouse = data.get("lighthouseResult", {})
+    categories = lighthouse.get("categories", {})
+    audits = lighthouse.get("audits", {})
+
+    category = categories.get(category_key, {})
+    score = round(category["score"] * 100) if category.get("score") is not None else None
+
+    failing_audits = []
+    for ref in category.get("auditRefs", []):
+        audit_id = ref.get("id")
+        if audit_id in exclude_audit_ids:
+            continue
+        audit = audits.get(audit_id)
+        if audit and audit.get("score") == 0:
+            failing_audits.append({
+                "id": audit_id,
+                "title": audit.get("title"),
+                "description": (audit.get("description") or "")[:300],
+            })
+
+    return score, failing_audits
+
+
+def check_accessibility_and_best_practices(url: str, strategy: str = "mobile") -> dict:
+    """Run a real Lighthouse audit (same PageSpeed Insights call as
+    check_core_web_vitals -- shares its cache, so calling both for the same
+    url/strategy costs at most one extra API request) and return the
+    Accessibility category: a 0-100 score plus the specific WCAG-adjacent
+    checks that failed (color contrast, missing alt text, unlabeled form
+    fields, missing ARIA attributes, etc.), each with Lighthouse's own audit
+    id/title/description. This is real automated-audit data, not a guess --
+    but automated tools only catch roughly 30-50% of real WCAG issues, so
+    treat this as a floor, not a substitute for manual/assistive-tech review."""
+    data = _get_lighthouse_data(url, strategy)
+    if data is None:
+        return {
+            "ok": False,
+            "error": "PageSpeed Insights API call failed (see logs for the underlying error).",
+            "note": "Real accessibility audit data unavailable this run.",
+        }
+
+    accessibility_score, failing_audits = _extract_category_score_and_failures(data, "accessibility")
+
+    return {
+        "ok": True,
+        "strategy": strategy,
+        "accessibility_score_0_100": accessibility_score,
+        "failing_accessibility_audits": failing_audits[:12],
+        "note": (
+            "Real Lighthouse accessibility audit (WCAG-adjacent automated checks), not a "
+            "manual accessibility audit -- automated tools catch roughly 30-50% of real WCAG "
+            "issues, so a high score here is NOT proof of full accessibility compliance. "
+            "Report it as a floor / starting point, and recommend manual or assistive-tech "
+            "testing for anything beyond these specific failures."
+        ),
+    }
+
+
+def check_best_practices(url: str, strategy: str = "mobile") -> dict:
+    """Run a real Lighthouse audit (same PageSpeed Insights call as
+    check_core_web_vitals/check_accessibility_and_best_practices -- shares
+    its cache, so calling this alongside either costs at most one extra API
+    request) and return the Best Practices category: a 0-100 score plus the
+    specific checks that failed (known-vulnerable JS libraries, deprecated
+    browser APIs, missing charset/doctype, unsafe third-party patterns,
+    console errors, etc.), each with Lighthouse's own audit id/title/
+    description.
+
+    Deliberately excludes HTTPS/SSL-related audits ("is-on-https",
+    "redirects-http") even though Lighthouse's Best Practices category
+    includes them -- that's the Security specialist's domain, which already
+    runs a dedicated, more authoritative SSL check
+    (check_ssl_certificate). Excluding it here in code, rather than only
+    telling the model not to mention it, avoids the exact
+    same-fact-from-two-sources contradiction bug this project has already
+    had to fix once for the Competitive specialist's on-page overlap."""
+    data = _get_lighthouse_data(url, strategy)
+    if data is None:
+        return {
+            "ok": False,
+            "error": "PageSpeed Insights API call failed (see logs for the underlying error).",
+            "note": "Real best-practices audit data unavailable this run.",
+        }
+
+    score, failing_audits = _extract_category_score_and_failures(
+        data, "best-practices", exclude_audit_ids={"is-on-https", "redirects-http"}
+    )
+
+    return {
+        "ok": True,
+        "strategy": strategy,
+        "best_practices_score_0_100": score,
+        "failing_best_practices_audits": failing_audits[:12],
+        "note": (
+            "Real Lighthouse Best Practices audit (browser/platform-level checks: vulnerable "
+            "JS libraries, deprecated APIs, unsafe patterns, console errors, etc.). HTTPS/SSL "
+            "checks are deliberately excluded from this data -- that's covered by the "
+            "Security specialist's dedicated SSL check instead."
+        ),
     }
 
 

@@ -27,6 +27,10 @@ TOOL_IMPL: dict[str, Callable[[dict], dict]] = {
     "analyze_security_headers": lambda args: tools.analyze_security_headers(args["headers"]),
     "check_links_status": lambda args: tools.check_links_status(args["urls"]),
     "check_core_web_vitals": lambda args: tools.check_core_web_vitals(args["url"], args.get("strategy", "mobile")),
+    "check_accessibility_and_best_practices": lambda args: tools.check_accessibility_and_best_practices(
+        args["url"], args.get("strategy", "mobile")
+    ),
+    "check_best_practices": lambda args: tools.check_best_practices(args["url"], args.get("strategy", "mobile")),
 }
 
 # Groq formats wait times as e.g. "11.065s", "6m53.856s", or "1h4m12.576s" --

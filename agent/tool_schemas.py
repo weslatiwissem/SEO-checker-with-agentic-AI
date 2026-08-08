@@ -109,6 +109,42 @@ CHECK_CORE_WEB_VITALS = _tool(
     ["url"],
 )
 
+CHECK_ACCESSIBILITY_AND_BEST_PRACTICES = _tool(
+    "check_accessibility_and_best_practices",
+    (
+        "Run a REAL Lighthouse accessibility audit via Google's PageSpeed Insights API -- "
+        "same underlying data source as check_core_web_vitals, so calling both for the same "
+        "URL is cheap. Returns a 0-100 accessibility score plus the specific WCAG-adjacent "
+        "checks that failed (color contrast, missing alt text, unlabeled form fields, "
+        "missing ARIA attributes, etc.) with each audit's id/title/description. This is "
+        "real automated-audit data, but automated tools only catch roughly 30-50% of real "
+        "WCAG issues -- treat a clean result as a floor, not proof of full compliance."
+    ),
+    {
+        "url": {"type": "string", "description": "The URL to audit"},
+        "strategy": {"type": "string", "description": "\"mobile\" or \"desktop\" (default mobile)"},
+    },
+    ["url"],
+)
+
+CHECK_BEST_PRACTICES = _tool(
+    "check_best_practices",
+    (
+        "Run a REAL Lighthouse Best Practices audit via Google's PageSpeed Insights API -- "
+        "same underlying data source as check_core_web_vitals, so calling it alongside that "
+        "or check_accessibility_and_best_practices for the same URL is cheap. Returns a "
+        "0-100 score plus the specific checks that failed: known-vulnerable JS libraries, "
+        "deprecated browser APIs, missing charset/doctype, unsafe third-party patterns, "
+        "console errors, etc. HTTPS/SSL checks are deliberately excluded -- that's the "
+        "Security specialist's domain."
+    ),
+    {
+        "url": {"type": "string", "description": "The URL to audit"},
+        "strategy": {"type": "string", "description": "\"mobile\" or \"desktop\" (default mobile)"},
+    },
+    ["url"],
+)
+
 # Named groups handed to each specialist agent. The "competitive" specialist
 # intentionally has no client tools -- it runs on Groq's Compound system,
 # which performs web search server-side and does not support custom tools
@@ -119,6 +155,7 @@ TOOL_GROUPS = {
     "performance": [FETCH_PAGE, PARSE_SEO_ELEMENTS, CHECK_CORE_WEB_VITALS],
     "security": [FETCH_PAGE, CHECK_SSL_CERTIFICATE, ANALYZE_SECURITY_HEADERS],
     "links": [FETCH_PAGE, PARSE_SEO_ELEMENTS, CHECK_LINKS_STATUS],
+    "accessibility": [FETCH_PAGE, PARSE_SEO_ELEMENTS, CHECK_ACCESSIBILITY_AND_BEST_PRACTICES],
+    "best_practices": [FETCH_PAGE, CHECK_BEST_PRACTICES],
     "competitive": [],
 }
-

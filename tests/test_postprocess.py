@@ -274,3 +274,294 @@ class TestFixStaleCwvDataLimitations:
         report = {"data_limitations": "Link checking was a sample, not a full crawl."}
         postprocess.fix_stale_cwv_data_limitations(report, had_real_cwv=True)
         assert "Note:" not in report["data_limitations"]
+
+
+# --------------------------------------------------------------------------
+# reconcile_accessibility_data
+# --------------------------------------------------------------------------
+
+class TestReconcileAccessibilityData:
+    A11Y_LOG = [{
+        "name": "check_accessibility_and_best_practices",
+        "result": {
+            "ok": True,
+            "accessibility_score_0_100": 71,
+            "failing_accessibility_audits": [
+                {"id": "color-contrast", "title": "Insufficient color contrast", "description": "..."},
+                {"id": "image-alt", "title": "Images missing alt attributes", "description": "..."},
+            ],
+        },
+    }]
+
+    def test_injects_canonical_finding_when_model_didnt_cite_score(self):
+        result = {"category": "Accessibility", "findings": [
+            {"severity": "warning", "issue": "Accessibility could be improved in a few places.", "recommendation": "Review manually."},
+        ]}
+        out = postprocess.reconcile_accessibility_data(result, self.A11Y_LOG)
+        assert out["_real_accessibility_available"] is True
+        assert any("71" in f["issue"] for f in out["findings"])
+        assert any("color-contrast" in f["issue"] or "Insufficient color contrast" in f["issue"] for f in out["findings"])
+
+    def test_noop_when_model_already_cites_real_score(self):
+        result = {"findings": [
+            {"severity": "warning", "issue": "Lighthouse accessibility score is 71/100.", "recommendation": "Fix contrast issues."},
+        ]}
+        out = postprocess.reconcile_accessibility_data(result, self.A11Y_LOG)
+        assert len(out["findings"]) == 1
+        assert "_real_accessibility_available" not in out
+
+    def test_noop_when_tool_never_called(self):
+        result = {"findings": []}
+        out = postprocess.reconcile_accessibility_data(result, [])
+        assert out["findings"] == []
+
+    def test_noop_when_tool_failed(self):
+        log = [{"name": "check_accessibility_and_best_practices", "result": {"ok": False, "error": "timeout"}}]
+        result = {"findings": []}
+        out = postprocess.reconcile_accessibility_data(result, log)
+        assert out["findings"] == []
+
+    def test_critical_severity_for_low_score(self):
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True, "accessibility_score_0_100": 30, "failing_accessibility_audits": [],
+        }}]
+        out = postprocess.reconcile_accessibility_data({"findings": []}, log)
+        assert out["findings"][0]["severity"] == "critical"
+
+    def test_good_severity_for_high_score_with_no_failures(self):
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True, "accessibility_score_0_100": 96, "failing_accessibility_audits": [],
+        }}]
+        out = postprocess.reconcile_accessibility_data({"findings": []}, log)
+        assert out["findings"][0]["severity"] == "good"
+        assert "No automated check failures" in out["findings"][0]["issue"]
+
+    def test_warning_severity_for_mid_range_score(self):
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True, "accessibility_score_0_100": 75, "failing_accessibility_audits": [],
+        }}]
+        out = postprocess.reconcile_accessibility_data({"findings": []}, log)
+        assert out["findings"][0]["severity"] == "warning"
+
+    def test_no_duplicate_when_model_already_covered_all_failures_without_stating_score(self):
+        """Regression test for a real observed bug: the model wrote accurate,
+        specific findings clearly sourced from this exact tool call (matching
+        each failing audit's topic) but never spelled out the literal score
+        number -- that must NOT be treated as 'didn't cite real data' and
+        must NOT produce a duplicate finding repeating the same four issues."""
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True,
+            "accessibility_score_0_100": 88,
+            "failing_accessibility_audits": [
+                {"id": "color-contrast", "title": "Background and foreground colors do not have a sufficient contrast ratio.", "description": ""},
+                {"id": "frame-title", "title": "`<frame>` or `<iframe>` elements do not have a title", "description": ""},
+                {"id": "heading-order", "title": "Heading elements are not in a sequentially-descending order", "description": ""},
+                {"id": "link-name", "title": "Links do not have a discernible name", "description": ""},
+            ],
+        }}]
+        result = {"category": "Accessibility", "findings": [
+            {"severity": "warning", "issue": "Insufficient color contrast", "recommendation": "Improve color contrast between background and foreground elements"},
+            {"severity": "warning", "issue": "Missing frame titles", "recommendation": "Add titles to frame and iframe elements"},
+            {"severity": "warning", "issue": "Incorrect heading order", "recommendation": "Ensure heading elements are in a sequentially-descending order"},
+            {"severity": "warning", "issue": "Links without discernible names", "recommendation": "Make links accessible by adding discernible and unique link text"},
+        ]}
+        out = postprocess.reconcile_accessibility_data(result, log)
+        assert len(out["findings"]) == 4  # nothing appended
+        assert "_real_accessibility_available" not in out
+
+    def test_tops_up_only_the_uncovered_failing_checks(self):
+        """Partial coverage: model covered one failing check but missed the
+        other -- only the uncovered one should be added, not both again."""
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True,
+            "accessibility_score_0_100": 60,
+            "failing_accessibility_audits": [
+                {"id": "color-contrast", "title": "Insufficient color contrast", "description": ""},
+                {"id": "image-alt", "title": "Images are missing alt attributes", "description": ""},
+            ],
+        }}]
+        result = {"findings": [
+            {"severity": "warning", "issue": "Color contrast is too low in several places.", "recommendation": "Fix it."},
+        ]}
+        out = postprocess.reconcile_accessibility_data(result, log)
+        assert len(out["findings"]) == 2
+        injected = out["findings"][1]
+        assert "image" in injected["issue"].lower()
+        assert "color" not in injected["issue"].lower()  # already-covered one not repeated
+
+    def test_no_duplicate_for_plural_and_word_order_variation(self):
+        """Regression test for a second real observed bug: the model wrote
+        'ARIA parent roles missing required child roles' (singular 'child')
+        against an audit whose title says '...required children', and 'List
+        items not contained within...' against an audit id 'listitem' (one
+        fused word). Exact-substring matching missed both as 'uncovered'
+        and injected a duplicate. Stemmed/majority-keyword matching must
+        catch both as already covered."""
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True,
+            "accessibility_score_0_100": 77,
+            "failing_accessibility_audits": [
+                {
+                    "id": "aria-required-children",
+                    "title": "Elements with an ARIA [role] that require children to contain a "
+                              "specific [role] are missing some or all of those required children.",
+                    "description": "",
+                },
+                {
+                    "id": "listitem",
+                    "title": "List items (<li>) are not contained within <ul>, <ol> or <menu> "
+                              "parent elements.",
+                    "description": "",
+                },
+            ],
+        }}]
+        result = {"category": "Accessibility", "findings": [
+            {"severity": "warning", "issue": "ARIA parent roles missing required child roles",
+             "recommendation": "Add required child roles to ARIA parent roles to ensure proper accessibility functions"},
+            {"severity": "warning", "issue": "List items not contained within ul, ol, or menu parent elements",
+             "recommendation": "Contain list items within ul, ol, or menu parent elements to ensure proper screen reader announcement"},
+        ]}
+        out = postprocess.reconcile_accessibility_data(result, log)
+        assert len(out["findings"]) == 2  # nothing appended
+        assert "_real_accessibility_available" not in out
+
+    def test_majority_overlap_is_enough_not_exact_match(self):
+        """A finding doesn't need to restate every keyword -- a solid
+        majority of the audit's significant keywords being present should
+        count as covered."""
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True,
+            "accessibility_score_0_100": 80,
+            "failing_accessibility_audits": [
+                {"id": "button-name", "title": "Buttons do not have an accessible name", "description": ""},
+            ],
+        }}]
+        result = {"findings": [
+            {"severity": "warning", "issue": "Some buttons are missing accessible names.", "recommendation": "Add labels."},
+        ]}
+        out = postprocess.reconcile_accessibility_data(result, log)
+        assert len(out["findings"]) == 1  # covered, nothing appended
+
+    def test_genuinely_unrelated_finding_still_triggers_injection(self):
+        """Sanity check the improved matcher doesn't become too lenient --
+        a finding about a completely different topic must still count as
+        'uncovered' and trigger injection."""
+        log = [{"name": "check_accessibility_and_best_practices", "result": {
+            "ok": True,
+            "accessibility_score_0_100": 40,
+            "failing_accessibility_audits": [
+                {"id": "color-contrast", "title": "Background and foreground colors do not have a sufficient contrast ratio", "description": ""},
+            ],
+        }}]
+        result = {"findings": [
+            {"severity": "good", "issue": "The site has a valid sitemap.", "recommendation": "No action needed."},
+        ]}
+        out = postprocess.reconcile_accessibility_data(result, log)
+        assert len(out["findings"]) == 2
+        assert out["_real_accessibility_available"] is True
+
+
+# --------------------------------------------------------------------------
+# reconcile_best_practices_data
+# --------------------------------------------------------------------------
+
+class TestReconcileBestPracticesData:
+    BP_LOG = [{
+        "name": "check_best_practices",
+        "result": {
+            "ok": True,
+            "best_practices_score_0_100": 67,
+            "failing_best_practices_audits": [
+                {"id": "no-vulnerable-libraries", "title": "Includes JS libraries with known vulnerabilities", "description": "..."},
+                {"id": "deprecations", "title": "Uses deprecated APIs", "description": "..."},
+            ],
+        },
+    }]
+
+    def test_injects_canonical_finding_when_model_didnt_cite_score(self):
+        result = {"category": "Best Practices", "findings": [
+            {"severity": "warning", "issue": "A few best practice issues were found.", "recommendation": "Review manually."},
+        ]}
+        out = postprocess.reconcile_best_practices_data(result, self.BP_LOG)
+        assert out["_real_best_practices_available"] is True
+        assert any("67" in f["issue"] for f in out["findings"])
+
+    def test_noop_when_model_already_cites_real_score(self):
+        result = {"findings": [
+            {"severity": "warning", "issue": "Best Practices score is 67/100.", "recommendation": "Fix vulnerable libraries."},
+        ]}
+        out = postprocess.reconcile_best_practices_data(result, self.BP_LOG)
+        assert len(out["findings"]) == 1
+        assert "_real_best_practices_available" not in out
+
+    def test_noop_when_model_already_covers_all_failing_checks(self):
+        """Same matcher, same guarantee as accessibility: substantively
+        covered findings shouldn't get duplicated just because the exact
+        score digit wasn't stated."""
+        result = {"findings": [
+            {"severity": "warning", "issue": "Includes vulnerable JavaScript libraries.", "recommendation": "Update them."},
+            {"severity": "warning", "issue": "Uses deprecated APIs.", "recommendation": "Migrate off them."},
+        ]}
+        out = postprocess.reconcile_best_practices_data(result, self.BP_LOG)
+        assert len(out["findings"]) == 2
+        assert "_real_best_practices_available" not in out
+
+    def test_noop_when_tool_never_called(self):
+        result = {"findings": []}
+        out = postprocess.reconcile_best_practices_data(result, [])
+        assert out["findings"] == []
+
+    def test_noop_when_tool_failed(self):
+        log = [{"name": "check_best_practices", "result": {"ok": False, "error": "timeout"}}]
+        result = {"findings": []}
+        out = postprocess.reconcile_best_practices_data(result, log)
+        assert out["findings"] == []
+
+    def test_does_not_interfere_with_accessibility_reconciliation(self):
+        """The two reconciliation functions must be independent -- one
+        specialist's tool_call_log has both real tool calls, but each
+        reconciliation function should only act on its own tool's data."""
+        log = [
+            {"name": "check_accessibility_and_best_practices", "result": {
+                "ok": True, "accessibility_score_0_100": 90, "failing_accessibility_audits": [],
+            }},
+            {"name": "check_best_practices", "result": {
+                "ok": True, "best_practices_score_0_100": 50,
+                "failing_best_practices_audits": [{"id": "deprecations", "title": "Uses deprecated APIs", "description": ""}],
+            }},
+        ]
+        result = {"findings": []}
+        result = postprocess.reconcile_accessibility_data(result, log)
+        result = postprocess.reconcile_best_practices_data(result, log)
+        assert len(result["findings"]) == 2
+        assert result["_real_accessibility_available"] is True
+        assert result["_real_best_practices_available"] is True
+
+    def test_coincidental_percentage_digit_doesnt_count_as_score_citation(self):
+        """Regression test for a real bug found while testing: a coincidental
+        digit match (score=50 vs. the boilerplate phrase '30-50% of real
+        WCAG issues' left over from a prior finding) must not be treated as
+        'the model already cited the score' -- the number has to plausibly
+        refer to the score itself, not just appear anywhere nearby."""
+        log = [{"name": "check_best_practices", "result": {
+            "ok": True,
+            "best_practices_score_0_100": 50,
+            "failing_best_practices_audits": [{"id": "deprecations", "title": "Uses deprecated APIs", "description": ""}],
+        }}]
+        result = {"findings": [
+            {"severity": "good", "issue": "Accessibility is solid overall.",
+             "recommendation": "Automated checks catch roughly 30-50% of real WCAG issues."},
+        ]}
+        out = postprocess.reconcile_best_practices_data(result, log)
+        assert len(out["findings"]) == 2  # injection still happened
+        assert out["_real_best_practices_available"] is True
+
+    def test_score_cited_as_slash_100_is_recognized(self):
+        log = [{"name": "check_best_practices", "result": {
+            "ok": True, "best_practices_score_0_100": 67, "failing_best_practices_audits": [],
+        }}]
+        result = {"findings": [
+            {"severity": "warning", "issue": "Best Practices score: 67/100.", "recommendation": "Review manually."},
+        ]}
+        out = postprocess.reconcile_best_practices_data(result, log)
+        assert len(out["findings"]) == 1

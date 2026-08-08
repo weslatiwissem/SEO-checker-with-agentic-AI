@@ -22,7 +22,8 @@ from .postprocess import (
     reconcile_ssl_findings, strip_competitive_onpage_overlap,
     fix_summary_trend_mismatch, fix_fabricated_trend_claim,
     reconcile_likely_blocked, reconcile_core_web_vitals,
-    fix_stale_cwv_data_limitations,
+    fix_stale_cwv_data_limitations, reconcile_accessibility_data,
+    reconcile_best_practices_data,
 )
 from .config import (
     MAX_PARALLEL_SPECIALISTS, SPECIALIST_DISPATCH_STAGGER_SECONDS,
@@ -61,6 +62,8 @@ CANONICAL_CATEGORY_NAMES = {
     "performance": "Page Speed",
     "security": "Web Security",
     "links": "Link Health",
+    "accessibility": "Accessibility",
+    "best_practices": "Best Practices",
     "competitive": "Competitive & Industry Benchmarking",
 }
 
@@ -75,6 +78,8 @@ def _run_one_specialist(key: str, url: str, competitor_url: str | None, cfg: dic
     result = reconcile_likely_blocked(result, agent.tool_call_log, log_fn=log_fn)
     result = reconcile_ssl_findings(result, agent.tool_call_log, log_fn=log_fn)
     result = reconcile_core_web_vitals(result, agent.tool_call_log, log_fn=log_fn)  # <-- new
+    result = reconcile_accessibility_data(result, agent.tool_call_log, log_fn=log_fn)
+    result = reconcile_best_practices_data(result, agent.tool_call_log, log_fn=log_fn)
     if key == "competitive":
         result = strip_competitive_onpage_overlap(result, log_fn=log_fn)
     result["category"] = CANONICAL_CATEGORY_NAMES.get(key, result.get("category", key))
@@ -166,6 +171,27 @@ def _recover_or_drop_empty_categories(report: dict, specialist_reports: dict, lo
     report["categories"] = kept
 
 
+def _drop_issues_resolved_by_reconciliation(issues: list[str]) -> list[str]:
+    """The critic's review runs BEFORE _reconcile_overall_score, so one
+    specific class of its complaint -- category weights not summing to
+    ~1.0 -- is unconditionally fixed by that deterministic normalization
+    step on every single run (see _reconcile_overall_score above).
+    Surfacing that complaint as still-"unresolved" in the final report is
+    stale and actively misleading: the report the user is looking at has
+    already had its weights normalized to sum to 1.0 by the time they read
+    this list. Drop only that narrow, mechanically-guaranteed-resolved
+    class of complaint; leave substantive judgment calls (e.g. "the score
+    still seems too high given the findings") alone, since those aren't
+    something a deterministic step fixes."""
+    kept = []
+    for issue in issues:
+        lowered = issue.lower()
+        if "weight" in lowered and "sum" in lowered:
+            continue
+        kept.append(issue)
+    return kept
+
+
 def run_full_audit(
     url: str,
     competitor_url: str | None = None,
@@ -187,7 +213,7 @@ def run_full_audit(
                         model=cfg["planner"], fallback_model=cfg["fallback"], log_fn=log_fn)
     specialist_keys = [k for k in plan.get("specialists", []) if k in SPECIALIST_DEFINITIONS]
     if not specialist_keys:
-        specialist_keys = ["technical_seo", "content", "performance", "security", "links"]
+        specialist_keys = ["technical_seo", "content", "performance", "security", "links", "accessibility", "best_practices"]
     log_fn(f"  -> Plan: {specialist_keys} ({plan.get('reasoning', '')})")
 
     log_fn(f"Stage 2/4: Dispatching {len(specialist_keys)} specialist agents "
@@ -247,6 +273,7 @@ def run_full_audit(
     was_approved = bool(reflection_log) and reflection_log[-1].get("review", {}).get("approved")
     if not was_approved:
         unresolved = reflection_log[-1].get("review", {}).get("issues", []) if reflection_log else []
+        unresolved = _drop_issues_resolved_by_reconciliation(unresolved)
         final_report["review_status"] = "not_approved"
         final_report["unresolved_review_issues"] = unresolved
         log_fn(f"  -> WARNING: report was NOT approved by the critic after "
