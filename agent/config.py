@@ -42,3 +42,14 @@ SPECIALIST_DISPATCH_STAGGER_SECONDS = float(os.environ.get("SEO_AGENT_DISPATCH_S
 RATE_LIMIT_MAX_RETRIES = int(os.environ.get("SEO_AGENT_RATE_LIMIT_RETRIES", 4))
 
 DB_PATH = os.environ.get("SEO_AGENT_DB_PATH", os.path.join(os.getcwd(), "data", "audit_history.db"))
+
+# Proactive payload compaction (agent/compaction.py) -- estimates the
+# synthesizer/critic request size BEFORE sending and, only above this
+# threshold, trims lower-priority findings and overlong free-text fields so
+# the first request has a real chance of succeeding instead of relying on
+# base_agent.py's reactive 413-triggered shrinking. Deliberately a rough
+# characters-per-token estimate, not an exact count -- see compaction.py.
+COMPACTION_TOKEN_THRESHOLD = int(os.environ.get("SEO_AGENT_COMPACTION_TOKEN_THRESHOLD", 4000))
+COMPACTION_MAX_FINDINGS_PER_CATEGORY = int(os.environ.get("SEO_AGENT_COMPACTION_MAX_FINDINGS", 12))
+COMPACTION_MAX_EVIDENCE_NOTES_CHARS = int(os.environ.get("SEO_AGENT_COMPACTION_MAX_EVIDENCE_CHARS", 600))
+COMPACTION_MAX_FINDING_TEXT_CHARS = int(os.environ.get("SEO_AGENT_COMPACTION_MAX_FINDING_CHARS", 400))

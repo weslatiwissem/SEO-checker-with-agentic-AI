@@ -524,6 +524,17 @@ def _reconcile_lighthouse_category_data(
     severity = "critical" if (score is not None and score < 50) else (
         "warning" if (score is not None and score < 90) else "good"
     )
+    # A high score can genuinely coexist with a "failing" audit -- Lighthouse
+    # has zero-weight/informational audits (e.g. "missing source maps") that
+    # don't count toward the category score. That's real, accurate data, but
+    # presenting it as "OK ... score: 100/100. Failing checks include: X" is
+    # self-contradictory to read regardless of the underlying nuance being
+    # correct. Never label a finding "good" while it's also naming a failing
+    # check -- observed for real: a 100/100 Best Practices score with one
+    # zero-weight failing audit got shipped as an "OK" finding that also
+    # said "Failing checks include: Missing source maps...".
+    if uncovered and severity == "good":
+        severity = "warning"
 
     if uncovered:
         examples = "; ".join(a.get("title", a.get("id", "?")) for a in uncovered[:5])

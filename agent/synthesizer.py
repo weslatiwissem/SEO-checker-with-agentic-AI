@@ -7,6 +7,7 @@ import json
 
 from .base_agent import ToolAgent
 from .config import DEFAULT_MODEL, FALLBACK_MODEL
+from .compaction import maybe_compact_specialist_reports
 
 SYNTHESIZER_SYSTEM_PROMPT = """You are the synthesizer agent in a multi-agent SEO audit system.
 You receive independent JSON reports from several specialist agents (technical SEO, content,
@@ -53,6 +54,8 @@ def run_synthesizer(
 ) -> dict:
     agent = ToolAgent(name="Synthesizer", system_prompt=SYNTHESIZER_SYSTEM_PROMPT, model=model,
                        fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index, log_fn=log_fn)
+
+    specialist_reports = maybe_compact_specialist_reports(specialist_reports, log_fn=log_fn)
 
     payload = {
         "url": url,

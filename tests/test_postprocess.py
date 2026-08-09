@@ -565,3 +565,33 @@ class TestReconcileBestPracticesData:
         ]}
         out = postprocess.reconcile_best_practices_data(result, log)
         assert len(out["findings"]) == 1
+
+    def test_no_ok_severity_when_a_failing_check_is_still_named(self):
+        """Regression test for a real observed bug: Lighthouse can report a
+        perfect 100/100 score while still flagging one zero-weight/
+        informational audit as failing (e.g. missing source maps, which
+        doesn't count toward the score). That combination is real and
+        accurate, but labeling the resulting finding 'good'/OK while it
+        also says 'Failing checks include: X' reads as self-contradictory.
+        A finding that names a failing check must never be 'good'."""
+        log = [{"name": "check_best_practices", "result": {
+            "ok": True,
+            "best_practices_score_0_100": 100,
+            "failing_best_practices_audits": [
+                {"id": "source-maps", "title": "Missing source maps for large first-party JavaScript", "description": ""},
+            ],
+        }}]
+        result = {"findings": []}
+        out = postprocess.reconcile_best_practices_data(result, log)
+        assert out["findings"][0]["severity"] != "good"
+        assert "Failing checks include" in out["findings"][0]["issue"]
+
+    def test_still_good_when_perfect_score_and_no_failing_checks_at_all(self):
+        """Sanity check the fix isn't overcorrecting -- a genuinely clean
+        100/100 with nothing failing should still say 'good'."""
+        log = [{"name": "check_best_practices", "result": {
+            "ok": True, "best_practices_score_0_100": 100, "failing_best_practices_audits": [],
+        }}]
+        out = postprocess.reconcile_best_practices_data({"findings": []}, log)
+        assert out["findings"][0]["severity"] == "good"
+        assert "No automated check failures detected" in out["findings"][0]["issue"]

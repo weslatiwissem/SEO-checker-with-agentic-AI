@@ -12,6 +12,7 @@ import json
 from .base_agent import ToolAgent
 from .synthesizer import run_synthesizer
 from .config import CRITIC_MODEL, MAX_REFLECTION_ROUNDS, DEFAULT_MODEL, FALLBACK_MODEL
+from .compaction import maybe_compact_specialist_reports, maybe_compact_report
 
 CRITIC_SYSTEM_PROMPT = """You are the critic agent in a multi-agent SEO audit system. You review
 a draft report produced by a synthesizer agent against the raw specialist findings it was built
@@ -42,6 +43,8 @@ def critique(draft: dict, specialist_reports: dict, model: str = CRITIC_MODEL,
              fallback_model: str | None = FALLBACK_MODEL, key_index: int = 0, log_fn=None) -> dict:
     agent = ToolAgent(name="Critic", system_prompt=CRITIC_SYSTEM_PROMPT, model=model,
                        fallback_model=fallback_model, max_output_tokens=3500, starting_key_index=key_index, log_fn=log_fn)
+    draft = maybe_compact_report(draft, log_fn=log_fn)
+    specialist_reports = maybe_compact_specialist_reports(specialist_reports, log_fn=log_fn)
     payload = {"draft_report": draft, "specialist_reports": specialist_reports}
     return agent.run(json.dumps(payload, indent=2))
 
