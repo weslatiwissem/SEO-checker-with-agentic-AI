@@ -10,6 +10,7 @@ the model to self-correct.
 """
 from __future__ import annotations
 
+import math
 import re
 
 _SSL_KEYWORDS = ("certificate", "ssl", "https/ssl", "tls")
@@ -430,6 +431,34 @@ def _latest_tool_result(tool_call_log: list[dict], tool_name: str) -> dict | Non
     return None
 
 
+def keyword_topic_covered(keywords: list[str] | set[str], text: str | None = None, *,
+                           tokens: set[str] | None = None, threshold_fraction: float = 0.5) -> bool:
+    """Public, general-purpose version of the stemmed/majority-keyword
+    overlap check: True if a majority of the given keywords (stemmed, to
+    tolerate plurals like "children"/"child") appear somewhere in the
+    target text, without requiring an exact phrase match. This is the same
+    matching logic behind _lighthouse_audit_topic_already_covered below --
+    exposed here as a public, reusable primitive because the eval harness
+    needs the identical "does this text substantively mention topic X"
+    judgment to grade whether a report caught a known issue, and
+    reimplementing it a second time risks reintroducing the exact bugs
+    already fixed once (plurals, word order, fused words like "listitem"
+    all producing false "not covered" negatives with naive substring
+    matching).
+
+    Pass either `text` (raw, will be tokenized) or a pre-tokenized `tokens`
+    set (to avoid re-tokenizing the same findings text once per audit, as
+    the internal Lighthouse-reconciliation callers below do)."""
+    stemmed_keywords = {_lighthouse_stem(k) for k in keywords if len(k) >= 3}
+    if not stemmed_keywords:
+        return False
+    if tokens is None:
+        tokens = _lighthouse_tokenize(text or "")
+    matched = sum(1 for k in stemmed_keywords if k in tokens)
+    threshold = max(1, math.ceil(len(stemmed_keywords) * threshold_fraction))
+    return matched >= threshold
+
+
 def _lighthouse_audit_topic_already_covered(audit: dict, findings_tokens: set[str]) -> bool:
     """True if the model's findings already substantively reference this
     specific failing Lighthouse audit -- judged by stemmed-keyword overlap
@@ -441,13 +470,7 @@ def _lighthouse_audit_topic_already_covered(audit: dict, findings_tokens: set[st
     id_words = re.split(r"[-_]", audit.get("id", ""))
     title_words = re.findall(r"[a-zA-Z]+", audit.get("title", ""))
     candidates = [w for w in id_words + title_words if len(w) >= 4 and w.lower() not in _LIGHTHOUSE_AUDIT_STOPWORDS]
-    keywords = {_lighthouse_stem(w) for w in candidates}
-    if not keywords:
-        return False
-
-    matched = sum(1 for k in keywords if k in findings_tokens)
-    threshold = max(1, (len(keywords) + 1) // 2)  # majority, rounded up
-    return matched >= threshold
+    return keyword_topic_covered(candidates, tokens=findings_tokens)
 
 
 def _mentions_score(findings_text: str, score) -> bool:

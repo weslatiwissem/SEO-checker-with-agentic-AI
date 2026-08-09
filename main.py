@@ -19,6 +19,7 @@ load_dotenv()  # MUST run before importing agent.* -- agent/config.py reads
 from agent import run_full_audit
 from agent import memory
 from agent.report_pdf import export_report_pdf
+from agent.eval_harness import run_eval, print_eval_summary
 
 
 def _log(msg: str) -> None:
@@ -103,6 +104,18 @@ def cmd_history(args):
     print("-" * 64 + "\n")
 
 
+def cmd_eval(args):
+    summary = run_eval(mode=args.mode, log_fn=_log if not args.quiet else (lambda m: None))
+    print_eval_summary(summary)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Full JSON results written to {args.out}")
+    # Non-zero exit if anything failed, so this can be dropped into CI.
+    if summary["cases_fully_passed"] < summary["case_count"]:
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-agent SEO & website health checker")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -124,6 +137,15 @@ def main():
     p_history.add_argument("url", help="URL or domain to look up")
     p_history.add_argument("--limit", type=int, default=10)
     p_history.set_defaults(func=cmd_history)
+
+    p_eval = sub.add_parser("eval", help="Run the self-grading eval harness against known benchmark sites")
+    p_eval.add_argument("--mode", choices=["quick", "deep", "auto"], default="quick",
+                         help="quick (default): cheapest, always uses the small model -- "
+                              "recommended for repeated/CI runs. auto/deep: more thorough, "
+                              "more expensive validation pass.")
+    p_eval.add_argument("--out", help="Write full JSON results to this file", default=None)
+    p_eval.add_argument("--quiet", action="store_true", help="Suppress live agent activity log")
+    p_eval.set_defaults(func=cmd_eval)
 
     args = parser.parse_args()
     args.func(args)
