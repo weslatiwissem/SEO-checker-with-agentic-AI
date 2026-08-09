@@ -10,8 +10,11 @@ over time.
 Runs entirely on **Groq's free-tier API** (OpenAI-compatible, very fast,
 open-weight models) — no paid model provider required. Hardened through
 extensive real-world testing against live sites (Wikipedia, YouTube, Apple,
-YouTube Music, and others) to survive both Groq's free-tier limits and the
-kinds of mistakes LLMs make when asked to self-report facts and do arithmetic.
+Samsung, Internet Archive's blog, YouTube Music, and others) to survive both
+Groq's free-tier limits and the kinds of mistakes LLMs make when asked to
+self-report facts and do arithmetic. Backed by a 192-test automated `pytest`
+suite and a self-grading eval harness that runs the real pipeline against
+known-issue benchmark sites (see Testing / Eval harness below).
 
 No frontend in this document — CLI + importable library. (A Next.js web UI
 exists as a separate, in-progress add-on; see the `webapp/` project if you're
@@ -24,40 +27,41 @@ looking for that.)
                          │   Planner   │  decides which specialists to run
                          └──────┬──────┘
                                 │
-        ┌───────────┬──────────┼──────────┬───────────┐
-        ▼           ▼          ▼           ▼           ▼
-   Technical    Content    Performance  Security     Links       (Competitive*)
-     SEO                    +Lighthouse                          *Groq Compound
-   Specialist  Specialist  Specialist  Specialist   Specialist   (built-in search)
-        │           │          │           │           │              │
-        └───────────┴──────────┴─────┬─────┴───────────┴──────────────┘
-                                      ▼
-                          ┌────────────────────────┐
-                          │  Deterministic cleanup  │  SSL fact-check, CWV fact-
-                          │     (postprocess.py)    │  check, on-page/technical
-                          │                         │  overlap removal
-                          └───────────┬─────────────┘
-                                      ▼
-                              ┌───────────────┐
-                              │  Synthesizer  │  merges + weights + scores
-                              └───────┬───────┘
-                                      ▼
-                              ┌───────────────┐
-                    ┌────────►│    Critic     │  reflection / self-critique
-                    │         └───────┬───────┘
-                    │ revise if       ▼
-                    │ not approved  approved?
-                    └────────────── no ── yes ──► Draft Report
-                                                        │
-                                                        ▼
-                                   Category recovery/cleanup, deterministic
-                                   score/weight/trend reconciliation
-                                                        │
-                                                        ▼
-                                                  Final Report
-                                                        │
-                                                        ▼
-                                             SQLite memory (trend tracking)
+        ┌───────────────────────┴────────────────────────┐
+        │       Up to 8 specialists run concurrently      │
+        │  Technical SEO · Content · Performance+LH ·     │
+        │  Security · Links · Accessibility ·             │
+        │  Best Practices · Competitive*                  │
+        │               (*Groq Compound, built-in search) │
+        └───────────────────────┬────────────────────────┘
+                                 ▼
+                     ┌────────────────────────┐
+                     │  Deterministic cleanup  │  SSL / CWV / accessibility /
+                     │     (postprocess.py)    │  best-practices fact-check,
+                     │                         │  on-page overlap removal
+                     └───────────┬─────────────┘
+                                 ▼
+                         ┌───────────────┐
+                         │  Synthesizer  │  merges + weights + scores
+                         └───────┬───────┘
+                                 ▼
+                         ┌───────────────┐
+               ┌────────►│    Critic     │  reflection / self-critique
+               │         └───────┬───────┘
+               │ revise if       ▼
+               │ not approved  approved?
+               └────────────── no ── yes ──► Draft Report
+                                                   │
+                                                   ▼
+                          Category recovery/cleanup, deterministic
+                       score/weight/trend reconciliation, stale-issue
+                                        filtering
+                                                   │
+                                                   ▼
+                                             Final Report
+                                                   │
+                                                   ▼
+                                        SQLite memory (trend tracking)
 ```
 
 ## How this project evolved
@@ -151,6 +155,39 @@ current design exists because of a specific bug caught this way:
   bundles its own up-to-date root CA list via `certifi`; the raw `ssl`
   module used for the certificate check did not, and could diverge from it
   on some systems. Fixed by using the same `certifi` bundle for both.
+- **The exact same "vague finding instead of citing real data" bug showed
+  up again for accessibility and best-practices data — and the first fix
+  for it wasn't robust enough, twice.** After wiring in real Lighthouse
+  accessibility/best-practices audits, the "did the model already cite the
+  real data" check first used exact-substring matching, which produced
+  false "not covered" results (and duplicate injected findings) on
+  perfectly good writing: plurals ("child" vs. the audit's "children"),
+  word order ("list items" vs. the audit id `listitem`), and simple
+  omission of the literal score digit. Fixed with a stemmed,
+  majority-keyword-overlap matcher (`postprocess.py::keyword_topic_covered`)
+  shared by both categories instead of two independent copies — reusing one
+  fixed implementation rather than risking the same bug drifting back in
+  twice. A related false positive also showed up during testing: a
+  coincidental digit match (a score of 50 "matching" the unrelated phrase
+  "30-50% of real WCAG issues" elsewhere in the text) wrongly suppressed a
+  real injection — fixed with a boundary-aware regex that won't match a
+  number embedded inside another number or a percentage.
+- **A resolved complaint can still get shown to the user as "unresolved."**
+  The critic's review runs *before* `_reconcile_overall_score`'s automatic
+  weight normalization — so "category weights don't sum to 1.0" was a
+  complaint the critic could raise on its last round, get silently fixed by
+  the very next step, and then still show up in the final printed
+  `unresolved_review_issues`, telling the user to distrust something that
+  was already correct in the report they were looking at. Fixed by
+  `orchestrator.py::_drop_issues_resolved_by_reconciliation`, which strips
+  only that specific, mechanically-guaranteed-resolved complaint class —
+  substantive judgment calls (e.g. "the score still seems too high") are
+  left alone, since those aren't something a deterministic step fixes.
+
+All three of the bugs above were caught by actually running the pipeline
+against real live sites (blog.archive.org, samsung.com, apple.com) after
+each change and reading the output closely — not just by adding a feature
+and assuming a clean first run meant it worked.
 
 The net effect: the LLM layer is treated as a fallible reasoning engine that
 proposes findings, while anything that can be verified or computed outright
@@ -161,11 +198,12 @@ guardrails were added instead of just asking more firmly.
 
 ## Agentic AI features
 
-1. **Multi-agent orchestration** — a planner agent and up to six specialist
+1. **Multi-agent orchestration** — a planner agent and up to seven specialist
    agents (technical SEO, content, performance, security, link health,
-   competitive/benchmarking), each with its own system prompt and restricted
-   tool set, run **concurrently** via a thread pool and are reconciled by a
-   synthesizer agent.
+   accessibility, best practices, plus competitive/benchmarking when
+   relevant), each with its own system prompt and restricted tool set, run
+   **concurrently** via a thread pool and are reconciled by a synthesizer
+   agent.
 2. **Reflection / self-critique loop** — a critic agent reviews the
    synthesizer's draft against the raw specialist evidence, checking for
    hallucinated claims, miscalibrated scores, and internal inconsistency. If
@@ -174,16 +212,26 @@ guardrails were added instead of just asking more firmly.
    the last round, it stops at the last-reviewed draft rather than running
    one further, unreviewed revision. If still unresolved, the report is
    marked `review_status: "not_approved"` with the specific unresolved
-   issues attached.
+   issues attached — filtered to drop complaints the deterministic
+   reconciliation step has since mechanically resolved (e.g. weight-sum
+   normalization), so the list stays honest.
 3. **Tool use / function calling** — every specialist decides which of its
    tools to call and in what order (fetch pages, parse HTML, check
    robots.txt/sitemap, verify SSL, inspect security headers, sample links,
    run a real Lighthouse audit).
-4. **Real performance data via Google PageSpeed Insights** — the performance
-   specialist calls a genuine Lighthouse audit (not a proxy signal): actual
-   LCP, CLS, Total Blocking Time, Speed Index, a 0-100 performance score,
-   and real-world Chrome User Experience Report field data when available.
-   Automatically retries on Google's known-common transient 500 errors.
+4. **Real performance, accessibility, and best-practices data via Google
+   PageSpeed Insights** — the performance, accessibility, and best-practices
+   specialists each pull from a genuine Lighthouse audit (not a proxy
+   signal): actual LCP/CLS/TBT/Speed Index and a performance score, real
+   WCAG-adjacent accessibility check failures, and real best-practices audit
+   failures (vulnerable JS libraries, deprecated APIs, console errors,
+   etc.). All three share one cached PageSpeed Insights call per
+   `(url, strategy)` pair, so requesting the extra categories is genuinely
+   near-free rather than tripling the API cost. Best Practices
+   deterministically excludes HTTPS/SSL-related audit results (Security's
+   domain already covers that, more authoritatively) rather than relying on
+   a prompt instruction to avoid the overlap. Automatically retries on
+   Google's known-common transient 500 errors.
 5. **Live web-search-augmented research** — the competitive/benchmarking
    specialist runs on Groq's **Compound** system (`groq/compound-mini`),
    which performs web search server-side automatically.
@@ -193,15 +241,28 @@ guardrails were added instead of just asking more firmly.
    against a Pydantic schema before being trusted downstream.
 8. **A deterministic fact-checking layer** (`postprocess.py`) that catches
    an entire class of LLM self-reporting failures in code rather than
-   prompting: SSL reconciliation, real Core Web Vitals injection, stale
-   data-limitations correction, cross-specialist on-page/technical overlap
-   removal, summary/trend contradiction and fabrication detection, bot-block
-   detection, and empty-category recovery.
+   prompting: SSL reconciliation, real Core Web Vitals/accessibility/
+   best-practices injection (via a shared, stemmed keyword-overlap matcher,
+   not exact-substring matching), stale data-limitations correction,
+   cross-specialist on-page/technical overlap removal, summary/trend
+   contradiction and fabrication detection, bot-block detection, empty-
+   category recovery, and stale-critic-complaint filtering.
 9. **Multi-key, multi-model resilience** — automatic fallback to a smaller
    model on rate/quota limits, proactive round-robin rotation across
    multiple configured API keys spanning the *entire* run (not just
    specialists), automatic payload-shrinking on request-too-large errors,
    and a JSON self-repair retry if a response comes back truncated.
+10. **Automated regression test suite** — 192 `pytest` tests covering every
+    deterministic reconciliation function, every tool implementation
+    (network fully mocked), the retry/rate-limit engine, the reflection
+    loop (including a dedicated regression test for a specific,
+    previously-reintroduced bug), and end-to-end pipeline wiring. See
+    Testing below.
+11. **Self-grading eval harness** — runs the real pipeline against a small,
+    curated set of benchmark sites with known, stable, verifiably-true
+    issues (an expired cert, a self-signed cert, an HTTP-only host, a page
+    missing a meta description), then grades the result in pure Python — no
+    LLM call is spent on grading. See Eval harness below.
 
 ## Setup
 
@@ -242,6 +303,12 @@ python main.py history https://example.com
 
 # Suppress the live agent activity log
 python main.py audit https://example.com --quiet
+
+# Run the self-grading eval harness against known-issue benchmark sites
+python main.py eval
+
+# Eval harness with the strong model instead of the default cheap/fast mode
+python main.py eval --mode auto --out eval_results.json
 ```
 
 Or use it as a library:
@@ -257,38 +324,56 @@ print(report["overall_score"], report["grade"], report["review_status"])
 
 ```
 seo_agent/
-├── main.py                  CLI entry point (audit / history subcommands, --mode flag)
+├── main.py                  CLI entry point (audit / history / eval subcommands, --mode flag)
+├── pytest.ini                pytest config -- `pytest` just works from the project root
 ├── requirements.txt
 ├── .env.example
 ├── README.md
-└── agent/
-    ├── __init__.py           exposes run_full_audit
-    ├── config.py             model names, API keys, & tunables, all overridable via env vars
-    ├── tools.py              low-level tool implementations: fetch (with bot-block detection),
-    │                         parse, ssl (certifi-based), headers, links (with bot-block
-    │                         detection), and real Core Web Vitals via PageSpeed Insights
-    │                         (with retry-on-transient-500)
-    ├── tool_schemas.py        Groq/OpenAI-format tool-use schemas, grouped per specialist
-    ├── base_agent.py          generic reusable ToolAgent -- the agentic loop runtime, including
-    │                          Groq rate-limit/quota handling, model fallback, API-key rotation,
-    │                          request-too-large payload shrinking, and JSON self-repair
-    ├── specialists.py         specialist system prompts + tool assignments
-    ├── planner.py             planning agent
-    ├── synthesizer.py         synthesizer agent
-    ├── critic.py              critic agent + reflection loop controller (stops at the last-
-    │                          reviewed draft rather than running an unreviewed final revision)
-    ├── postprocess.py         the deterministic fact-checking layer -- see "How this project
-    │                          evolved" above for what each function catches and why
-    ├── orchestrator.py        top-level pipeline: mode configs, canonical category names,
-    │                          category recovery/cleanup, deterministic score/weight
-    │                          reconciliation, wiring it all together
-    ├── memory.py              SQLite persistence + trend lookups
-    ├── schemas.py             Pydantic validation of the final report contract
-    ├── report_pdf.py          reportlab-based PDF export of a completed audit
-    └── compaction.py          NOT YET WIRED IN -- built to proactively shrink synthesizer/critic
-                               payloads (drop verbose fields, cap finding counts) before sending,
-                               rather than reactively shrinking only after a 413 error. A good
-                               next step if "request too large" retries are still frequent.
+├── agent/
+│   ├── __init__.py           exposes run_full_audit
+│   ├── config.py             model names, API keys, & tunables, all overridable via env vars
+│   ├── tools.py              low-level tool implementations: fetch (with bot-block detection),
+│   │                         parse, ssl (certifi-based), headers, links (with bot-block
+│   │                         detection), and real Lighthouse data via PageSpeed Insights --
+│   │                         Core Web Vitals, accessibility, and best-practices audits all
+│   │                         share one cached API call per (url, strategy) (with retry-on-
+│   │                         transient-500)
+│   ├── tool_schemas.py        Groq/OpenAI-format tool-use schemas, grouped per specialist
+│   ├── base_agent.py          generic reusable ToolAgent -- the agentic loop runtime, including
+│   │                          Groq rate-limit/quota handling, model fallback, API-key rotation,
+│   │                          request-too-large payload shrinking, and JSON self-repair
+│   ├── specialists.py         specialist system prompts + tool assignments (7 specialists +
+│   │                          competitive)
+│   ├── planner.py             planning agent
+│   ├── synthesizer.py         synthesizer agent
+│   ├── critic.py              critic agent + reflection loop controller (stops at the last-
+│   │                          reviewed draft rather than running an unreviewed final revision)
+│   ├── postprocess.py         the deterministic fact-checking layer -- see "How this project
+│   │                          evolved" above for what each function catches and why. Includes
+│   │                          the shared keyword_topic_covered matcher used both internally
+│   │                          (accessibility/best-practices dedup) and by the eval harness
+│   ├── orchestrator.py        top-level pipeline: mode configs, canonical category names,
+│   │                          category recovery/cleanup, deterministic score/weight
+│   │                          reconciliation, stale-critic-complaint filtering, wiring it all
+│   │                          together
+│   ├── memory.py              SQLite persistence + trend lookups
+│   ├── schemas.py             Pydantic validation of the final report contract
+│   ├── report_pdf.py          reportlab-based PDF export of a completed audit
+│   ├── eval_harness.py        self-grading eval harness -- see "Eval harness" below
+│   └── compaction.py          NOT YET WIRED IN -- built to proactively shrink synthesizer/critic
+│                               payloads (drop verbose fields, cap finding counts) before sending,
+│                               rather than reactively shrinking only after a 413 error. A good
+│                               next step if "request too large" retries are still frequent.
+└── tests/                     192 pytest tests -- see "Testing" below
+    ├── conftest.py             shared fixtures: fake Groq client/errors, sample report data
+    ├── test_base_agent.py      retry/backoff/rate-limit engine, the tool-call loop
+    ├── test_critic.py          reflection loop, incl. a dedicated regression test
+    ├── test_eval_harness.py    eval harness grading logic (run_full_audit fully mocked)
+    ├── test_memory.py          SQLite persistence
+    ├── test_orchestrator.py    score/weight reconciliation, category recovery, pipeline wiring
+    ├── test_postprocess.py     every deterministic reconciliation function
+    ├── test_schemas.py         the Pydantic report contract
+    └── test_tools.py           every tool implementation, network fully mocked
 ```
 
 ## Report shape
@@ -342,7 +427,79 @@ All overridable via environment variables (see `.env.example`):
 | `SEO_AGENT_RATE_LIMIT_RETRIES` | 4 | Max retry attempts on a rate-limited call before giving up |
 | `SEO_AGENT_DB_PATH` | `./data/audit_history.db` | SQLite history location |
 
-CLI-only: `--mode {quick,deep,auto}` (see Usage above).
+CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).
+
+## Testing
+
+```bash
+pip install pytest   # already in requirements.txt
+pytest                # runs all 192 tests, ~10-25s, zero network/API calls
+```
+
+Every test mocks the Groq client and any network calls (`requests.get`,
+`socket`, etc.) — the suite runs with no API key and no internet access.
+Coverage by file is in the Project layout table above; a few worth calling
+out specifically:
+
+- `test_critic.py` includes a test that reintroduces the exact reflection-
+  loop regression described in "How this project evolved" (the critic
+  rejecting on the final round used to trigger one more, unreviewed
+  synthesis pass) to confirm it's genuinely caught, not just present by
+  coincidence — verified by temporarily reverting the fix and watching the
+  test fail before restoring it.
+- `test_postprocess.py` includes regression tests for the accessibility/
+  best-practices duplicate-finding bugs and the stale-weight-complaint bug
+  described above, each reproducing the exact real-world finding text that
+  triggered them.
+- `test_eval_harness.py` includes a test that feeds the grader a synthetic
+  hallucinated "certificate is valid" report against the real
+  `expired-ssl-certificate` benchmark case, confirming the harness would
+  actually catch that regression if `reconcile_ssl_findings` ever broke.
+
+## Eval harness
+
+```bash
+python main.py eval                              # cheap/fast mode (default)
+python main.py eval --mode auto --out results.json  # more thorough, more expensive
+```
+
+Runs the **real** pipeline (real API calls, real network requests — not
+mocked) against 4 benchmark sites chosen specifically for having a known,
+stable, verifiably-true issue rather than being "representative" sites that
+could change tomorrow:
+
+| Case | Site | Known-true issue |
+|---|---|---|
+| `expired-ssl-certificate` | `expired.badssl.com` | permanently expired cert |
+| `self-signed-ssl-certificate` | `self-signed.badssl.com` | fails cert verification |
+| `http-only-no-tls` | `neverssl.com` | never redirects to HTTPS |
+| `minimal-page-missing-meta-description` | `example.com` | no meta description tag |
+
+Grading is **100% deterministic Python** — `postprocess.py::keyword_topic_covered`
+(the same stemmed/majority-keyword matcher used internally for
+accessibility/best-practices dedup) checks whether each site's known issue
+shows up in the right report category at the right severity. No LLM call is
+spent on grading; only the audits themselves consume API quota. One case
+(`expired-ssl-certificate`) also asserts the report must *not* contain
+phrases like "is valid" or "not expired" — a direct regression guard for the
+exact SSL-hallucination bug `reconcile_ssl_findings` exists to prevent.
+
+**Honest framing:** this measures *recall of a small set of known-true
+issues*, not full precision/recall in the ML sense — there's no ground truth
+for "every issue a page does or doesn't have," so false-positive rate isn't
+computable this way. What it does verify: "did the pipeline still catch the
+specific things we know for certain are true," which is exactly what a
+regression test needs even though it's not a complete quality benchmark.
+
+**Cost:** each case is one full `run_full_audit()` call — the same token
+cost as a real user audit (planner + specialists + synthesizer + up to 2
+critic rounds, each re-running the synthesizer). Defaults to `--mode quick`
+(small fallback model) specifically to keep repeated/CI runs affordable; a
+single run costs roughly 4x one normal quick-mode audit, not more, since
+grading itself is free. `quick` mode's model has a separate daily quota pool
+from `auto`/`deep` mode's primary model even on the same API key, so running
+`eval` regularly doesn't eat into everyday audit quota unless everyday usage
+is *also* run in `--mode quick`.
 
 ## Honest limitations
 
@@ -354,6 +511,13 @@ CLI-only: `--mode {quick,deep,auto}` (see Usage above).
   fraction fail at once, the tool flags this as likely bot-blocking rather
   than confidently reporting a broken-links crisis — but this still needs
   manual spot-checking to be sure.
+- Automated accessibility and best-practices audits (via Lighthouse) only
+  catch roughly 30-50% of real-world WCAG issues — a clean automated result
+  is a floor, not proof of full accessibility compliance. The report says
+  this explicitly rather than implying otherwise.
+- The eval harness measures recall of a small set of known-true issues, not
+  full precision — see "Eval harness" above for why that's a meaningfully
+  different (and more honest) claim than "measures accuracy."
 - Groq's free tier has real daily quota limits per model *and* per
   organization — multiple API keys only help if they're genuinely separate
   accounts/orgs, not just multiple keys within the same one.
@@ -380,3 +544,10 @@ CLI-only: `--mode {quick,deep,auto}` (see Usage above).
   recurring hallucination classes as they're discovered.
 - Add an "auto-fix" agent that drafts corrected meta tags / alt text for
   low-effort findings.
+- Grow the eval harness's benchmark set as more known-issue-with-a-stable-
+  ground-truth sites are identified — the current 4 cases are a floor, not a
+  target.
+- Hook `python main.py eval` into CI so a regression in the deterministic
+  layer gets caught automatically, not just when someone happens to notice
+  a duplicate/stale finding in a manual run (as items in "How this project
+  evolved" above were).
