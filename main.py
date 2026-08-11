@@ -105,7 +105,8 @@ def cmd_history(args):
 
 
 def cmd_eval(args):
-    summary = run_eval(mode=args.mode, log_fn=_log if not args.quiet else (lambda m: None))
+    summary = run_eval(mode=args.mode, sample_size=args.sample_size, seed=args.seed,
+                        log_fn=_log if not args.quiet else (lambda m: None))
     print_eval_summary(summary)
     if args.out:
         with open(args.out, "w") as f:
@@ -143,6 +144,12 @@ def main():
                          help="quick (default): cheapest, always uses the small model -- "
                               "recommended for repeated/CI runs. auto/deep: more thorough, "
                               "more expensive validation pass.")
+    p_eval.add_argument("--sample-size", type=int, default=None,
+                         help="How many benchmark cases to randomly sample from the pool "
+                              "(default 4). With N configured API keys, a sample size up to "
+                              "N spreads one key per case instead of concentrating load.")
+    p_eval.add_argument("--seed", type=int, default=None,
+                         help="Reproduce a specific sample from a previous run's logged seed")
     p_eval.add_argument("--out", help="Write full JSON results to this file", default=None)
     p_eval.add_argument("--quiet", action="store_true", help="Suppress live agent activity log")
     p_eval.set_defaults(func=cmd_eval)

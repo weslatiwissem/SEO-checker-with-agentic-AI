@@ -1,12 +1,19 @@
 """
 Self-grading eval harness.
 
-Runs the full audit pipeline against a small, curated set of benchmark
-sites chosen specifically because they have known, stable, verifiably-true
-issues (expired/self-signed certificates, plain-HTTP-only hosts, minimal
-pages missing standard SEO tags) -- then deterministically checks whether
-each audit's findings actually caught the issue, in the right category,
-at the right severity.
+Runs the full audit pipeline against a curated pool of benchmark sites
+chosen specifically because they have known, stable, verifiably-true
+issues (expired/self-signed/mismatched/untrusted certificates, plain-
+HTTP-only hosts, minimal pages missing standard SEO tags) -- then
+deterministically checks whether each audit's findings actually caught the
+issue, in the right category, at the right severity.
+
+Each run randomly SAMPLES a subset of the pool (default 4 of the available
+cases) rather than always running every case -- this exercises different
+combinations across repeated runs (catching a fix that happens to work for
+one site's exact phrasing but not another's) while keeping the cost of any
+single run bounded. Pass --seed to reproduce an exact sample from a
+previous run, e.g. to debug a specific failure.
 
 IMPORTANT, HONEST FRAMING: this measures RECALL of a small set of known-true
 issues, not full precision/recall in the ML sense. We don't have a ground
@@ -25,21 +32,36 @@ same token cost as a real user audit (planner + specialists + synthesizer +
 critic). Defaults to mode="quick" (small fallback model, cheapest quota
 pool) to keep repeated runs affordable; pass mode="auto"/"deep" for a more
 thorough but more expensive validation pass.
+
+Key rotation: each sampled case now starts its audit on a different
+configured GROQ_API_KEYS entry (via run_full_audit's starting_key_index),
+rather than every case starting on key 0 the way earlier versions of this
+harness did. This means more configured keys directly buys you headroom to
+raise --sample-size without concentrating load on a single key's daily
+quota -- with N keys, a sample size up to N spreads one key per case.
 """
 from __future__ import annotations
 
 import json
+import random
 import time
 from typing import Callable
 
+from .config import GROQ_API_KEYS
 from .orchestrator import run_full_audit
 from .postprocess import keyword_topic_covered
 
 
+DEFAULT_SAMPLE_SIZE = 4
+
 # Each case's `url` was picked specifically for a known, stable, deterministic
 # property -- not because it's a representative "real" site. Do not swap
 # these for arbitrary sites; the whole point is that the expected issue is
-# guaranteed true regardless of when this runs.
+# guaranteed true regardless of when this runs. The badssl.com-hosted cases
+# come from a site literally built for this purpose (permanently-broken TLS
+# test endpoints); the others are pages that have stayed unchanged for years
+# by design. New cases added here should be spot-checked with a real
+# `python main.py eval` run before being trusted, the same as any of these.
 BENCHMARK_CASES: list[dict] = [
     {
         "name": "expired-ssl-certificate",
@@ -68,6 +90,50 @@ BENCHMARK_CASES: list[dict] = [
                 "category": "Web Security",
                 "keywords": ["ssl", "certificate"],
                 "min_severity": "critical",
+                "must_not_contain": ["is valid"],
+            },
+        ],
+    },
+    {
+        "name": "wrong-hostname-ssl-certificate",
+        "url": "https://wrong.host.badssl.com/",
+        "notes": "badssl.com's dedicated hostname-mismatch test host -- serves a "
+                 "technically-valid certificate issued for a different domain, which "
+                 "standard hostname verification always rejects.",
+        "expected_findings": [
+            {
+                "category": "Web Security",
+                "keywords": ["ssl", "certificate"],
+                "min_severity": "critical",
+                "must_not_contain": ["is valid"],
+            },
+        ],
+    },
+    {
+        "name": "untrusted-root-ssl-certificate",
+        "url": "https://untrusted-root.badssl.com/",
+        "notes": "badssl.com's dedicated untrusted-CA test host -- signed by a root "
+                 "certificate authority no standard trust store recognizes.",
+        "expected_findings": [
+            {
+                "category": "Web Security",
+                "keywords": ["ssl", "certificate"],
+                "min_severity": "critical",
+                "must_not_contain": ["is valid"],
+            },
+        ],
+    },
+    {
+        "name": "no-encryption-null-cipher",
+        "url": "https://null.badssl.com/",
+        "notes": "badssl.com's dedicated NULL-cipher test host -- offers no real "
+                 "encryption, which modern TLS stacks refuse to negotiate at all.",
+        "expected_findings": [
+            {
+                "category": "Web Security",
+                "keywords": ["ssl", "certificate"],
+                "min_severity": "critical",
+                "must_not_contain": ["is valid"],
             },
         ],
     },
@@ -88,6 +154,19 @@ BENCHMARK_CASES: list[dict] = [
         "url": "https://example.com/",
         "notes": "IANA's example.com -- a deliberately minimal, extremely stable page "
                  "with no meta description tag.",
+        "expected_findings": [
+            {
+                "category": "On-Page Content",
+                "keywords": ["meta", "description"],
+                "min_severity": "warning",
+            },
+        ],
+    },
+    {
+        "name": "minimal-historical-page",
+        "url": "http://info.cern.ch/",
+        "notes": "The world's first website -- a historical-preservation page kept "
+                 "deliberately unchanged for years, with no meta description tag.",
         "expected_findings": [
             {
                 "category": "On-Page Content",
@@ -183,24 +262,52 @@ def grade_case(case: dict, report: dict) -> dict:
 def run_eval(
     mode: str = "quick",
     cases: list[dict] | None = None,
+    sample_size: int | None = None,
+    seed: int | None = None,
     use_memory: bool = False,
     log_fn: Callable[[str], None] | None = None,
 ) -> dict:
-    """Run the full pipeline against each benchmark case and grade it.
-    A single case's audit raising an exception is caught and recorded as a
-    failed case (with the error message) rather than aborting the whole
-    run -- one flaky/unreachable benchmark site shouldn't block grading
-    the others. Returns a summary dict; nothing here makes any grading
-    LLM call -- only the audits themselves consume API quota."""
+    """Run the full pipeline against a random sample of benchmark cases and
+    grade each one. A single case's audit raising an exception is caught
+    and recorded as a failed case (with the error message) rather than
+    aborting the whole run -- one flaky/unreachable benchmark site
+    shouldn't block grading the others. Returns a summary dict; nothing
+    here makes any grading LLM call -- only the audits themselves consume
+    API quota.
+
+    sample_size defaults to DEFAULT_SAMPLE_SIZE (4). If sample_size is at
+    least as large as the pool, every case runs, in the pool's original
+    order (no shuffling) -- randomization only kicks in for an actual
+    subset. seed makes a specific sample reproducible (logged either way,
+    so any run's exact sample can be replayed with --seed).
+
+    Each sampled case starts its audit on a different configured
+    GROQ_API_KEYS entry (round-robin by sample position) rather than every
+    case starting on key 0 -- see the module docstring for why."""
     log_fn = log_fn or (lambda msg: None)
-    cases = cases if cases is not None else BENCHMARK_CASES
+    pool = cases if cases is not None else BENCHMARK_CASES
+    sample_size = sample_size if sample_size is not None else DEFAULT_SAMPLE_SIZE
+    sample_size = max(1, min(sample_size, len(pool)))
+
+    if seed is None:
+        seed = random.SystemRandom().randrange(1_000_000_000)
+
+    if sample_size >= len(pool):
+        selected_cases = list(pool)  # running everything -- no shuffle, preserves pool order
+    else:
+        selected_cases = random.Random(seed).sample(pool, k=sample_size)
+
+    log_fn(f"[eval] Sampling {len(selected_cases)}/{len(pool)} benchmark case(s) "
+           f"(seed={seed}, mode={mode})...")
 
     case_results = []
-    for case in cases:
+    for i, case in enumerate(selected_cases):
+        key_index = i % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
         log_fn(f"[eval] Running benchmark case '{case['name']}' ({case['url']}) in mode={mode}...")
         started = time.monotonic()
         try:
-            report = run_full_audit(case["url"], use_memory=use_memory, mode=mode, log_fn=log_fn)
+            report = run_full_audit(case["url"], use_memory=use_memory, mode=mode,
+                                     log_fn=log_fn, starting_key_index=key_index)
         except Exception as e:
             log_fn(f"[eval]   -> FAILED to complete audit: {e}")
             case_results.append({
@@ -228,6 +335,9 @@ def run_eval(
 
     return {
         "mode": mode,
+        "seed": seed,
+        "sample_size": len(selected_cases),
+        "pool_size": len(pool),
         "case_count": len(case_results),
         "total_expected": total_expected,
         "total_caught": total_caught,
@@ -242,6 +352,8 @@ def print_eval_summary(summary: dict) -> None:
     print("EVAL HARNESS SUMMARY")
     print("=" * 64)
     print(f"Mode: {summary['mode']}")
+    print(f"Sample: {summary['sample_size']}/{summary['pool_size']} benchmark cases "
+          f"(seed={summary['seed']} -- pass --seed {summary['seed']} to reproduce this exact sample)")
     print(f"Known-issue recall: {summary['total_caught']}/{summary['total_expected']} "
           f"({summary['recall'] * 100:.1f}%)" if summary["recall"] is not None else "N/A")
     print(f"Cases fully passed: {summary['cases_fully_passed']}/{summary['case_count']}")
@@ -273,10 +385,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run the self-grading eval harness")
     parser.add_argument("--mode", choices=["quick", "auto", "deep"], default="quick")
+    parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
+                         help=f"How many benchmark cases to sample from the pool of "
+                              f"{len(BENCHMARK_CASES)} (default {DEFAULT_SAMPLE_SIZE}). "
+                              f"With N configured API keys, a sample size up to N spreads "
+                              f"one key per case.")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Reproduce a specific sample from a previous run's logged seed")
     parser.add_argument("--out", help="Write full JSON results to this file", default=None)
     args = parser.parse_args()
 
-    summary = run_eval(mode=args.mode, log_fn=print)
+    summary = run_eval(mode=args.mode, sample_size=args.sample_size, seed=args.seed, log_fn=print)
     print_eval_summary(summary)
     if args.out:
         with open(args.out, "w") as f:

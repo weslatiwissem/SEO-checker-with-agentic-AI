@@ -360,3 +360,89 @@ class TestBestPracticesSpecialistWiring:
 
         orchestrator.run_full_audit("https://example.com", use_memory=True, mode="quick")
         assert "best_practices" in seen_keys
+
+
+class TestStartingKeyIndex:
+    """Confirms run_full_audit's starting_key_index actually changes which
+    key each stage starts on -- this is what lets a caller running many
+    audits back-to-back (like the eval harness) spread them across all
+    configured keys instead of every single one starting on key 0."""
+
+    def test_planner_receives_the_starting_key_index(self, monkeypatch):
+        monkeypatch.setattr(orchestrator.memory, "get_last_audit", lambda url: None)
+        monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report: 1)
+        monkeypatch.setattr(orchestrator, "GROQ_API_KEYS", ["key0", "key1", "key2"])
+
+        captured = {}
+
+        def fake_planner(*a, **kw):
+            captured["key_index"] = kw.get("key_index")
+            return {"specialists": ["technical_seo"], "reasoning": "t"}
+
+        monkeypatch.setattr(orchestrator, "run_planner", fake_planner)
+
+        fake_agent = MagicMock()
+        fake_agent.run.return_value = {"category": "Technical SEO", "score": 80, "findings": []}
+        fake_agent.tool_call_log = []
+        monkeypatch.setattr(orchestrator, "build_specialist", lambda *a, **kw: fake_agent)
+        monkeypatch.setattr(orchestrator, "reflect_and_revise", lambda *a, **kw: (
+            {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+             "categories": [], "quick_wins": [], "data_limitations": ""},
+            [{"round": 1, "review": {"approved": True, "issues": [], "instructions_for_revision": ""}}],
+        ))
+
+        orchestrator.run_full_audit("https://example.com", starting_key_index=2)
+        assert captured["key_index"] == 2
+
+    def test_specialist_key_indices_are_offset_by_starting_key_index(self, monkeypatch):
+        monkeypatch.setattr(orchestrator.memory, "get_last_audit", lambda url: None)
+        monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report: 1)
+        monkeypatch.setattr(orchestrator, "GROQ_API_KEYS", ["key0", "key1", "key2"])
+        monkeypatch.setattr(orchestrator, "run_planner", lambda *a, **kw: {
+            "specialists": ["technical_seo", "content"], "reasoning": "t",
+        })
+
+        seen_key_indices = []
+
+        def fake_build_specialist(key, key_index=0, **kw):
+            seen_key_indices.append(key_index)
+            agent = MagicMock()
+            agent.run.return_value = {"category": key, "score": 80, "findings": []}
+            agent.tool_call_log = []
+            return agent
+
+        monkeypatch.setattr(orchestrator, "build_specialist", fake_build_specialist)
+        monkeypatch.setattr(orchestrator, "reflect_and_revise", lambda *a, **kw: (
+            {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+             "categories": [], "quick_wins": [], "data_limitations": ""},
+            [{"round": 1, "review": {"approved": True, "issues": [], "instructions_for_revision": ""}}],
+        ))
+
+        orchestrator.run_full_audit("https://example.com", starting_key_index=1)
+        # 2 specialists, starting_key_index=1, 3 keys -> expect indices {1, 2}, not {0, 1}
+        assert sorted(seen_key_indices) == [1, 2]
+
+    def test_default_starting_key_index_is_zero_backward_compatible(self, monkeypatch):
+        monkeypatch.setattr(orchestrator.memory, "get_last_audit", lambda url: None)
+        monkeypatch.setattr(orchestrator.memory, "save_audit", lambda url, report: 1)
+        monkeypatch.setattr(orchestrator, "GROQ_API_KEYS", ["key0", "key1"])
+
+        captured = {}
+
+        def fake_planner(*a, **kw):
+            captured["key_index"] = kw.get("key_index")
+            return {"specialists": ["technical_seo"], "reasoning": "t"}
+
+        monkeypatch.setattr(orchestrator, "run_planner", fake_planner)
+        fake_agent = MagicMock()
+        fake_agent.run.return_value = {"category": "Technical SEO", "score": 80, "findings": []}
+        fake_agent.tool_call_log = []
+        monkeypatch.setattr(orchestrator, "build_specialist", lambda *a, **kw: fake_agent)
+        monkeypatch.setattr(orchestrator, "reflect_and_revise", lambda *a, **kw: (
+            {"url": "https://example.com", "overall_score": 80.0, "grade": "B", "summary": "s",
+             "categories": [], "quick_wins": [], "data_limitations": ""},
+            [{"round": 1, "review": {"approved": True, "issues": [], "instructions_for_revision": ""}}],
+        ))
+
+        orchestrator.run_full_audit("https://example.com")  # no starting_key_index passed
+        assert captured["key_index"] == 0

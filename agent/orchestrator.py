@@ -198,6 +198,7 @@ def run_full_audit(
     use_memory: bool = True,
     mode: str = "auto",
     log_fn: Callable[[str], None] | None = None,
+    starting_key_index: int = 0,
 ) -> dict:
     log_fn = log_fn or (lambda msg: None)
     cfg = MODE_CONFIGS.get(mode, MODE_CONFIGS["auto"])
@@ -207,10 +208,15 @@ def run_full_audit(
     previous_audit = memory.get_last_audit(url) if use_memory else None
 
     log_fn(f"Stage 1/4: Planning audit scope... (mode: {mode})")
-    # Planner only runs once per audit, so it staying on key 0 has low impact
-    # compared to synthesizer/critic, which run repeatedly in Stage 3.
+    # starting_key_index lets a caller running many audits back-to-back in
+    # one process (e.g. the eval harness) start each audit's key rotation
+    # on a different key -- without this, every single audit always began
+    # on key 0 regardless of how many prior audits already ran in this
+    # process, so multiple configured keys never actually got used across
+    # a sequence of audits, only within one.
     plan = run_planner(url, competitor_url, has_history=previous_audit is not None,
-                        model=cfg["planner"], fallback_model=cfg["fallback"], log_fn=log_fn)
+                        model=cfg["planner"], fallback_model=cfg["fallback"],
+                        key_index=starting_key_index, log_fn=log_fn)
     specialist_keys = [k for k in plan.get("specialists", []) if k in SPECIALIST_DEFINITIONS]
     if not specialist_keys:
         specialist_keys = ["technical_seo", "content", "performance", "security", "links", "accessibility", "best_practices"]
@@ -228,8 +234,10 @@ def run_full_audit(
             # Proactively spread specialists across available keys (round-robin)
             # rather than only reactively rotating after one key's exhausted --
             # with multiple keys this avoids ever hitting the limit in the
-            # first place for most runs.
-            key_index = i % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
+            # first place for most runs. Offset by starting_key_index so a
+            # caller running several audits in sequence doesn't have every
+            # single one begin on the same key.
+            key_index = (i + starting_key_index) % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
             futures[pool.submit(_run_one_specialist, key, url, competitor_url, cfg, key_index, log_fn)] = key
 
         for future in as_completed(futures):
@@ -253,7 +261,7 @@ def run_full_audit(
     # rather than resetting back to key 0 -- synthesizer/critic run multiple
     # times in this stage and previously always hit whichever key specialist
     # #0 used, every single time.
-    stage3_start_index = len(specialist_keys) % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
+    stage3_start_index = (len(specialist_keys) + starting_key_index) % len(GROQ_API_KEYS) if GROQ_API_KEYS else 0
     draft, reflection_log = reflect_and_revise(
         url, specialist_reports, previous_audit,
         synthesizer_model=cfg["primary"], critic_model=cfg["critic"],

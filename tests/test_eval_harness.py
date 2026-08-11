@@ -154,7 +154,7 @@ class TestRunEval:
         audit call per case does."""
         call_count = {"n": 0}
 
-        def fake_audit(url, use_memory=False, mode="quick", log_fn=None):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
             call_count["n"] += 1
             return _report_with_category("Web Security", [
                 {"severity": "critical", "issue": "SSL certificate has expired.", "recommendation": "Renew it."},
@@ -173,7 +173,7 @@ class TestRunEval:
              "expected_findings": [{"category": "Web Security", "keywords": ["ssl", "certificate", "expired"], "min_severity": "critical"}]},
         ]
 
-        def fake_audit(url, use_memory=False, mode="quick", log_fn=None):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
             if "unreachable" in url:
                 raise RuntimeError("simulated total pipeline failure")
             return _report_with_category("Web Security", [
@@ -200,7 +200,7 @@ class TestRunEval:
              ]},
         ]
 
-        def fake_audit(url, use_memory=False, mode="quick", log_fn=None):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
             return {
                 "url": url, "review_status": "approved",
                 "categories": [
@@ -221,7 +221,7 @@ class TestRunEval:
     def test_default_mode_is_quick_for_cost_reasons(self, monkeypatch):
         captured_modes = []
 
-        def fake_audit(url, use_memory=False, mode="quick", log_fn=None):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
             captured_modes.append(mode)
             return _report_with_category("Web Security", [])
 
@@ -233,7 +233,7 @@ class TestRunEval:
         """Benchmark runs shouldn't pollute or depend on real audit history."""
         captured = {}
 
-        def fake_audit(url, use_memory=False, mode="quick", log_fn=None):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
             captured["use_memory"] = use_memory
             return _report_with_category("Web Security", [])
 
@@ -264,3 +264,144 @@ class TestBenchmarkCasesShape:
     def test_case_names_are_unique(self):
         names = [c["name"] for c in eval_harness.BENCHMARK_CASES]
         assert len(names) == len(set(names))
+
+
+class TestSamplingAndKeyRotation:
+    def _pool(self, n):
+        return [
+            {"name": f"case-{i}", "url": f"https://site{i}.example.com",
+             "expected_findings": [{"category": "Web Security", "keywords": ["ssl"], "min_severity": "warning"}]}
+            for i in range(n)
+        ]
+
+    def test_default_sample_size_is_four(self):
+        assert eval_harness.DEFAULT_SAMPLE_SIZE == 4
+
+    def test_samples_fewer_cases_than_full_pool(self, monkeypatch):
+        seen_urls = []
+
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            seen_urls.append(url)
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        summary = eval_harness.run_eval(cases=self._pool(10), sample_size=3, seed=42)
+        assert len(seen_urls) == 3
+        assert summary["sample_size"] == 3
+        assert summary["pool_size"] == 10
+
+    def test_same_seed_produces_the_same_sample(self, monkeypatch):
+        seen_urls_runs = []
+
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            seen_urls_runs[-1].append(url)
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        pool = self._pool(10)
+
+        seen_urls_runs.append([])
+        eval_harness.run_eval(cases=pool, sample_size=3, seed=123)
+        seen_urls_runs.append([])
+        eval_harness.run_eval(cases=pool, sample_size=3, seed=123)
+
+        assert seen_urls_runs[0] == seen_urls_runs[1]
+
+    def test_different_seeds_can_produce_different_samples(self, monkeypatch):
+        """Not a strict guarantee for every possible pair, but with a pool
+        of 10 and a sample of 3, two different seeds producing the exact
+        same sample would be a coincidence worth being suspicious of."""
+        seen_urls_runs = []
+
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            seen_urls_runs[-1].append(url)
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        pool = self._pool(10)
+
+        seen_urls_runs.append([])
+        eval_harness.run_eval(cases=pool, sample_size=3, seed=1)
+        seen_urls_runs.append([])
+        eval_harness.run_eval(cases=pool, sample_size=3, seed=2)
+
+        assert seen_urls_runs[0] != seen_urls_runs[1]
+
+    def test_sample_size_capped_at_pool_size(self, monkeypatch):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        summary = eval_harness.run_eval(cases=self._pool(3), sample_size=100)
+        assert summary["sample_size"] == 3
+        assert summary["case_count"] == 3
+
+    def test_sampling_the_full_pool_preserves_order_no_shuffle(self, monkeypatch):
+        seen_urls = []
+
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            seen_urls.append(url)
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        pool = self._pool(4)
+        eval_harness.run_eval(cases=pool, sample_size=4)
+        assert seen_urls == [c["url"] for c in pool]
+
+    def test_a_random_seed_is_generated_when_none_given_and_reported(self, monkeypatch):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        summary = eval_harness.run_eval(cases=self._pool(10), sample_size=3)
+        assert isinstance(summary["seed"], int)
+
+    def test_each_case_gets_a_different_starting_key_index_round_robin(self, monkeypatch):
+        monkeypatch.setattr(eval_harness, "GROQ_API_KEYS", ["key0", "key1", "key2"])
+        seen_key_indices = []
+
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            seen_key_indices.append(starting_key_index)
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        eval_harness.run_eval(cases=self._pool(5), sample_size=5)
+        assert seen_key_indices == [0, 1, 2, 0, 1]  # round-robin over 3 keys, 5 cases
+
+    def test_no_key_rotation_when_no_keys_configured(self, monkeypatch):
+        monkeypatch.setattr(eval_harness, "GROQ_API_KEYS", [])
+        seen_key_indices = []
+
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            seen_key_indices.append(starting_key_index)
+            return _report_with_category("Web Security", [])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        eval_harness.run_eval(cases=self._pool(3), sample_size=3)
+        assert seen_key_indices == [0, 0, 0]
+
+    def test_recall_is_computed_only_over_the_sampled_cases(self, monkeypatch):
+        def fake_audit(url, use_memory=False, mode="quick", log_fn=None, starting_key_index=0):
+            return _report_with_category("Web Security", [
+                {"severity": "warning", "issue": "SSL note.", "recommendation": ""},
+            ])
+
+        monkeypatch.setattr(eval_harness, "run_full_audit", fake_audit)
+        summary = eval_harness.run_eval(cases=self._pool(10), sample_size=3, seed=7)
+        assert summary["total_expected"] == 3  # not 10 -- only the sampled cases count
+
+
+class TestExpandedBenchmarkPool:
+    def test_pool_now_has_at_least_eight_cases(self):
+        assert len(eval_harness.BENCHMARK_CASES) >= 8
+
+    def test_all_case_names_still_unique_after_expansion(self):
+        names = [c["name"] for c in eval_harness.BENCHMARK_CASES]
+        assert len(names) == len(set(names))
+
+    def test_new_ssl_failure_cases_have_forbidden_valid_claim_guard(self):
+        for case in eval_harness.BENCHMARK_CASES:
+            if "ssl" in case["name"] or "cipher" in case["name"]:
+                for expected in case["expected_findings"]:
+                    if expected["category"] == "Web Security":
+                        assert "must_not_contain" in expected, f"{case['name']} should guard against a false 'is valid' claim"
