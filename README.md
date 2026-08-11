@@ -12,7 +12,7 @@ open-weight models) — no paid model provider required. Hardened through
 extensive real-world testing against live sites (Wikipedia, YouTube, Apple,
 Samsung, Internet Archive's blog, YouTube Music, and others) to survive both
 Groq's free-tier limits and the kinds of mistakes LLMs make when asked to
-self-report facts and do arithmetic. Backed by a 192-test automated `pytest`
+self-report facts and do arithmetic. Backed by a 235-test automated `pytest`
 suite and a self-grading eval harness that runs the real pipeline against
 known-issue benchmark sites (see Testing / Eval harness below).
 
@@ -183,11 +183,41 @@ current design exists because of a specific bug caught this way:
   only that specific, mechanically-guaranteed-resolved complaint class —
   substantive judgment calls (e.g. "the score still seems too high") are
   left alone, since those aren't something a deterministic step fixes.
+- **The reactive 413-shrinking mechanism was recovering fine, but wastefully.**
+  Real runs occasionally hit a "request too large" error on a specialist's
+  payload — the existing reactive shrink-and-retry logic always recovered,
+  but each occurrence cost a failed API call and retry latency mid-run.
+  `agent/compaction.py` now estimates the synthesizer/critic payload size
+  *before* the first send and, only above a threshold, trims lowest-priority
+  findings and overlong free-text fields first — so the initial request has
+  a real shot at succeeding instead of needing a round-trip failure to find
+  out it was too big.
 
-All three of the bugs above were caught by actually running the pipeline
-against real live sites (blog.archive.org, samsung.com, apple.com) after
-each change and reading the output closely — not just by adding a feature
-and assuming a clean first run meant it worked.
+- **A finding could say "OK" and "Failing checks include: X" in the same
+  sentence.** Lighthouse can genuinely report a perfect 100/100 category
+  score while still flagging one zero-weight/informational audit as
+  "failing" (e.g. a missing JS source map that doesn't count toward the
+  score) — both facts are accurate, but the reconciliation layer's own
+  message-building logic labeled that combination "good" purely from the
+  score, producing self-contradictory text. The critic actually caught this
+  exact case on a real run ("a perfect score despite the presence of
+  issues...") but that complaint didn't survive to the final report. Fixed
+  by never labeling a finding "good" while it's also naming a failing
+  check, regardless of score.
+- **Every audit always started its API-key rotation from the same key,**
+  even when several were run back-to-back in one process (as the eval
+  harness does) — so configuring more `GROQ_API_KEYS` didn't actually
+  spread a *sequence* of audits across them, only the specialists *within*
+  one audit. `run_full_audit()` now accepts a `starting_key_index`, and the
+  eval harness passes a different one per sampled case (round-robin) — so
+  more configured keys now directly buys headroom to sample more benchmark
+  sites per run without concentrating load on a single key.
+
+These bugs (and the compaction/key-rotation improvements) were all found by
+actually running the pipeline against real live sites (blog.archive.org,
+samsung.com, apple.com, pathe.tn) after each change and reading the output
+closely — not just by adding a feature and assuming a clean first run meant
+it worked.
 
 The net effect: the LLM layer is treated as a fallible reasoning engine that
 proposes findings, while anything that can be verified or computed outright
@@ -252,17 +282,25 @@ guardrails were added instead of just asking more firmly.
    multiple configured API keys spanning the *entire* run (not just
    specialists), automatic payload-shrinking on request-too-large errors,
    and a JSON self-repair retry if a response comes back truncated.
-10. **Automated regression test suite** — 192 `pytest` tests covering every
+   `agent/compaction.py` handles the synthesizer/critic side of this
+   *proactively* rather than only reactively: it estimates request size
+   before sending and, only above a size threshold, trims lowest-priority
+   findings and overlong free-text fields — so the first request has a real
+   chance of succeeding instead of needing a 413 round-trip to find out it
+   was too big.
+10. **Automated regression test suite** — 235 `pytest` tests covering every
     deterministic reconciliation function, every tool implementation
     (network fully mocked), the retry/rate-limit engine, the reflection
     loop (including a dedicated regression test for a specific,
     previously-reintroduced bug), and end-to-end pipeline wiring. See
     Testing below.
-11. **Self-grading eval harness** — runs the real pipeline against a small,
-    curated set of benchmark sites with known, stable, verifiably-true
-    issues (an expired cert, a self-signed cert, an HTTP-only host, a page
-    missing a meta description), then grades the result in pure Python — no
-    LLM call is spent on grading. See Eval harness below.
+11. **Self-grading eval harness** — runs the real pipeline against a
+    randomly-sampled subset of a curated pool of benchmark sites with
+    known, stable, verifiably-true issues (expired/self-signed/mismatched/
+    untrusted certificates, an HTTP-only host, pages missing a meta
+    description), grading the result in pure Python — no LLM call is spent
+    on grading. Each sampled case starts on a different configured API key,
+    reproducible via a logged seed. See Eval harness below.
 
 ## Setup
 
@@ -360,13 +398,17 @@ seo_agent/
 │   ├── schemas.py             Pydantic validation of the final report contract
 │   ├── report_pdf.py          reportlab-based PDF export of a completed audit
 │   ├── eval_harness.py        self-grading eval harness -- see "Eval harness" below
-│   └── compaction.py          NOT YET WIRED IN -- built to proactively shrink synthesizer/critic
-│                               payloads (drop verbose fields, cap finding counts) before sending,
-│                               rather than reactively shrinking only after a 413 error. A good
-│                               next step if "request too large" retries are still frequent.
-└── tests/                     192 pytest tests -- see "Testing" below
+│   └── compaction.py          proactive payload compaction for the synthesizer/critic --
+│                               estimates request size BEFORE sending and, only above a
+│                               token-estimate threshold, drops lowest-priority ("good")
+│                               findings first and truncates overlong free-text fields, so
+│                               the first request has a real chance of succeeding instead of
+│                               relying on base_agent.py's reactive 413-triggered shrinking
+└── tests/                     235 pytest tests -- see "Testing" below
     ├── conftest.py             shared fixtures: fake Groq client/errors, sample report data
     ├── test_base_agent.py      retry/backoff/rate-limit engine, the tool-call loop
+    ├── test_compaction.py      proactive payload trimming, incl. the actual synthesizer/
+    │                           critic wiring (not just the compaction functions in isolation)
     ├── test_critic.py          reflection loop, incl. a dedicated regression test
     ├── test_eval_harness.py    eval harness grading logic (run_full_audit fully mocked)
     ├── test_memory.py          SQLite persistence
@@ -426,6 +468,10 @@ All overridable via environment variables (see `.env.example`):
 | `SEO_AGENT_DISPATCH_STAGGER` | 2.0 | Seconds between dispatching each specialist, to avoid an instant burst of requests |
 | `SEO_AGENT_RATE_LIMIT_RETRIES` | 4 | Max retry attempts on a rate-limited call before giving up |
 | `SEO_AGENT_DB_PATH` | `./data/audit_history.db` | SQLite history location |
+| `SEO_AGENT_COMPACTION_TOKEN_THRESHOLD` | 4000 | Estimated-token threshold above which the synthesizer/critic payload is proactively compacted before sending (see `agent/compaction.py`) |
+| `SEO_AGENT_COMPACTION_MAX_FINDINGS` | 12 | Max findings kept per category when compacting (lowest-severity dropped first) |
+| `SEO_AGENT_COMPACTION_MAX_EVIDENCE_CHARS` | 600 | Max length for `raw_evidence_notes`/critic instructions when compacting |
+| `SEO_AGENT_COMPACTION_MAX_FINDING_CHARS` | 400 | Max length for an individual finding's issue/recommendation text when compacting |
 
 CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).
 
@@ -433,7 +479,7 @@ CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).
 
 ```bash
 pip install pytest   # already in requirements.txt
-pytest                # runs all 192 tests, ~10-25s, zero network/API calls
+pytest                # runs all 235 tests, ~10-25s, zero network/API calls
 ```
 
 Every test mocks the Groq client and any network calls (`requests.get`,
@@ -459,30 +505,55 @@ out specifically:
 ## Eval harness
 
 ```bash
-python main.py eval                              # cheap/fast mode (default)
-python main.py eval --mode auto --out results.json  # more thorough, more expensive
+python main.py eval                                        # random 4-of-8 sample (default)
+python main.py eval --sample-size 8                         # run the whole pool
+python main.py eval --sample-size 3 --seed 123               # reproduce an exact past sample
+python main.py eval --mode auto --out results.json           # more thorough, more expensive
 ```
 
 Runs the **real** pipeline (real API calls, real network requests — not
-mocked) against 4 benchmark sites chosen specifically for having a known,
-stable, verifiably-true issue rather than being "representative" sites that
-could change tomorrow:
+mocked) against a random sample of a curated pool of benchmark sites, each
+chosen for having a known, stable, verifiably-true issue rather than being
+a "representative" site that could change tomorrow:
 
 | Case | Site | Known-true issue |
 |---|---|---|
 | `expired-ssl-certificate` | `expired.badssl.com` | permanently expired cert |
 | `self-signed-ssl-certificate` | `self-signed.badssl.com` | fails cert verification |
+| `wrong-hostname-ssl-certificate` | `wrong.host.badssl.com` | cert issued for a different domain |
+| `untrusted-root-ssl-certificate` | `untrusted-root.badssl.com` | signed by an untrusted CA |
+| `no-encryption-null-cipher` | `null.badssl.com` | refuses real encryption |
 | `http-only-no-tls` | `neverssl.com` | never redirects to HTTPS |
 | `minimal-page-missing-meta-description` | `example.com` | no meta description tag |
+| `minimal-historical-page` | `info.cern.ch` | no meta description tag |
+
+By default, each run randomly samples 4 of these 8 (`DEFAULT_SAMPLE_SIZE`
+in `eval_harness.py`) rather than always running the full pool — this
+exercises different combinations across repeated runs (catching a fix that
+happens to work for one site's exact phrasing but not another's) while
+keeping any single run's cost bounded. The exact sample is logged with a
+seed (`--seed 123` reproduces it exactly, e.g. to debug a specific
+failure); requesting a sample size at or above the pool size runs
+everything, in the pool's original order, no shuffling.
+
+**Each sampled case now starts its audit on a different configured
+`GROQ_API_KEYS` entry** (round-robin by sample position via
+`run_full_audit`'s `starting_key_index`), rather than every case starting
+on key 0 the way an earlier version of this harness did — that earlier
+behavior meant configuring more keys didn't actually spread a sequence of
+audits across them. With this fixed, more configured keys directly buys
+headroom to raise `--sample-size` without concentrating load on a single
+key's daily quota — a sample size up to N spreads one key per case with N
+keys configured.
 
 Grading is **100% deterministic Python** — `postprocess.py::keyword_topic_covered`
 (the same stemmed/majority-keyword matcher used internally for
 accessibility/best-practices dedup) checks whether each site's known issue
 shows up in the right report category at the right severity. No LLM call is
-spent on grading; only the audits themselves consume API quota. One case
-(`expired-ssl-certificate`) also asserts the report must *not* contain
-phrases like "is valid" or "not expired" — a direct regression guard for the
-exact SSL-hallucination bug `reconcile_ssl_findings` exists to prevent.
+spent on grading; only the audits themselves consume API quota. Every SSL-
+failure case also asserts the report must *not* contain a phrase like "is
+valid" — a direct regression guard for the exact SSL-hallucination bug
+`reconcile_ssl_findings` exists to prevent.
 
 **Honest framing:** this measures *recall of a small set of known-true
 issues*, not full precision/recall in the ML sense — there's no ground truth
@@ -491,15 +562,22 @@ computable this way. What it does verify: "did the pipeline still catch the
 specific things we know for certain are true," which is exactly what a
 regression test needs even though it's not a complete quality benchmark.
 
-**Cost:** each case is one full `run_full_audit()` call — the same token
-cost as a real user audit (planner + specialists + synthesizer + up to 2
-critic rounds, each re-running the synthesizer). Defaults to `--mode quick`
-(small fallback model) specifically to keep repeated/CI runs affordable; a
-single run costs roughly 4x one normal quick-mode audit, not more, since
-grading itself is free. `quick` mode's model has a separate daily quota pool
-from `auto`/`deep` mode's primary model even on the same API key, so running
-`eval` regularly doesn't eat into everyday audit quota unless everyday usage
-is *also* run in `--mode quick`.
+**Cost:** each sampled case is one full `run_full_audit()` call — the same
+token cost as a real user audit (planner + specialists + synthesizer + up
+to 2 critic rounds, each re-running the synthesizer). Defaults to
+`--mode quick` (small fallback model) specifically to keep repeated/CI runs
+affordable; a default run costs roughly 4x one normal quick-mode audit, not
+more, since grading itself is free. `quick` mode's model has a separate
+daily quota pool from `auto`/`deep` mode's primary model even on the same
+API key, so running `eval` regularly doesn't eat into everyday audit quota
+unless everyday usage is *also* run in `--mode quick`.
+
+New pool entries added later should be spot-checked with a real
+`python main.py eval` run before being trusted, the same as any existing
+one — none of these were (or can be) verified from a sandboxed environment
+without live internet access; they were chosen based on badssl.com's and
+info.cern.ch's well-documented, deliberately-permanent stability, not by
+directly confirming their current HTML/response against this codebase.
 
 ## Honest limitations
 
@@ -534,8 +612,6 @@ is *also* run in `--mode quick`.
 
 ## Possible next steps
 
-- Wire up `compaction.py` (see Project Layout) to proactively shrink
-  synthesizer/critic payloads instead of only reacting to 413s after the fact.
 - Wrap `run_full_audit()` in a FastAPI endpoint for a real backend/API (a
   first pass at this exists in the separate `webapp/` project).
 - Add a `crawl` mode that runs the pipeline across multiple pages of a site
@@ -544,9 +620,10 @@ is *also* run in `--mode quick`.
   recurring hallucination classes as they're discovered.
 - Add an "auto-fix" agent that drafts corrected meta tags / alt text for
   low-effort findings.
-- Grow the eval harness's benchmark set as more known-issue-with-a-stable-
-  ground-truth sites are identified — the current 4 cases are a floor, not a
-  target.
+- Keep growing the eval harness's benchmark pool (now 8, randomly sampled
+  4-at-a-time) as more known-issue-with-a-stable-ground-truth sites are
+  identified — the current 8 are a floor, not a target. Spot-check any new
+  entry with a real `python main.py eval` run before trusting it.
 - Hook `python main.py eval` into CI so a regression in the deterministic
   layer gets caught automatically, not just when someone happens to notice
   a duplicate/stale finding in a manual run (as items in "How this project
