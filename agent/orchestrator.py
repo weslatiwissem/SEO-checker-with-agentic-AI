@@ -143,30 +143,52 @@ def _recover_or_drop_empty_categories(report: dict, specialist_reports: dict, lo
     original findings first; only drop the category if there's genuinely
     nothing to show (e.g. the specialist itself failed, like a 413 error).
     Must run BEFORE _reconcile_overall_score so a truly-empty, dropped
-    category never counts toward the weighted average."""
+    category never counts toward the weighted average.
+
+    Also validates/recovers `score`, independently of findings. Observed in
+    the wild: a category can have non-empty findings (sometimes fabricated
+    by the synthesizer from a failed specialist's raw error text -- see the
+    raw_evidence_notes sanitization above) while its score is None/invalid,
+    which fails schema validation and would otherwise ship a category
+    showing a blank/"None" score in the final report. If the specialist's
+    own score is a valid number, recover that; if the specialist itself has
+    no valid score either (it genuinely failed), the whole category is
+    dropped even if it has findings, since those findings aren't backed by
+    anything trustworthy."""
     categories = report.get("categories") or []
     reverse_canonical = {v: k for k, v in CANONICAL_CATEGORY_NAMES.items()}
     kept = []
     for c in categories:
-        if c.get("findings"):
-            kept.append(c)
-            continue
+        has_findings = bool(c.get("findings"))
+        has_valid_score = isinstance(c.get("score"), (int, float))
 
         spec_key = reverse_canonical.get(c.get("name"))
         source = specialist_reports.get(spec_key) if spec_key else None
+        source_has_findings = bool(source and source.get("findings"))
+        source_has_valid_score = bool(source and isinstance(source.get("score"), (int, float)))
 
-        if source and source.get("findings"):
+        if not has_findings and source_has_findings:
             log_fn(
                 f"  -> '{c.get('name')}' had no findings in the synthesized draft but the "
                 f"original specialist report did -- recovering its real findings instead of dropping."
             )
             c["findings"] = source["findings"]
-            if not isinstance(c.get("score"), (int, float)) and isinstance(source.get("score"), (int, float)):
-                c["score"] = source["score"]
+            has_findings = True
+
+        if not has_valid_score and source_has_valid_score:
+            log_fn(
+                f"  -> '{c.get('name')}' had an invalid score ({c.get('score')!r}) in the "
+                f"synthesized draft -- recovering the specialist's real score ({source['score']})."
+            )
+            c["score"] = source["score"]
+            has_valid_score = True
+
+        if has_findings and has_valid_score:
             kept.append(c)
         else:
-            log_fn(f"  -> Dropping empty category '{c.get('name', '?')}' -- no findings "
-                   f"in draft or original specialist report.")
+            log_fn(f"  -> Dropping incomplete category '{c.get('name', '?')}' -- no valid "
+                   f"findings+score available in the draft or the original specialist report "
+                   f"(the specialist itself likely failed).")
 
     report["categories"] = kept
 
@@ -248,11 +270,29 @@ def run_full_audit(
                 log_fn(f"  -> {key} specialist done (score: {result.get('score')})")
             except Exception as e:
                 log_fn(f"  -> {key} specialist FAILED: {e}")
+                # Deliberately NOT including str(e) verbatim here. When a
+                # specialist fails because the model's JSON was truncated/
+                # invalid, the raised error message embeds that raw, never-
+                # successfully-parsed text (it's useful for a human reading
+                # the log). Observed in the wild: passing that same text
+                # into raw_evidence_notes let the synthesizer AND critic
+                # both treat quoted "findings" inside the failed attempt as
+                # if they were real, validated specialist data -- the
+                # critic cited specific findings/scores that existed only
+                # inside a JSON blob that was never actually parsed. A
+                # short, explicitly-non-data message avoids handing the
+                # next LLM stage something structured-looking to
+                # over-trust.
                 specialist_reports[key] = {
                     "category": key,
                     "score": None,
                     "findings": [],
-                    "raw_evidence_notes": f"Specialist failed to complete: {e}",
+                    "raw_evidence_notes": (
+                        "This specialist failed to complete due to a technical/formatting "
+                        "error. No reliable findings are available for this category -- do "
+                        "not infer, reconstruct, or cite any specific finding, score, or "
+                        "number for it."
+                    ),
                 }
     had_real_cwv = any(r.get("_real_cwv_available") for r in specialist_reports.values())
     

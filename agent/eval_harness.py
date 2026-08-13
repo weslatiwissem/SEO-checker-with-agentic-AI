@@ -137,18 +137,17 @@ BENCHMARK_CASES: list[dict] = [
             },
         ],
     },
-    {
-        "name": "http-only-no-tls",
-        "url": "http://neverssl.com/",
-        "notes": "neverssl.com is purpose-built to never redirect to HTTPS.",
-        "expected_findings": [
-            {
-                "category": "Web Security",
-                "keywords": ["ssl", "https", "certificate"],
-                "min_severity": "warning",
-            },
-        ],
-    },
+    # "http-only-no-tls" (neverssl.com) was REMOVED from the pool after a real
+    # eval run falsified its premise. The case assumed "neverssl.com never
+    # redirects http:// to https://" meant "has no valid SSL/TLS available,"
+    # but a real run showed check_ssl_certificate completing a genuinely
+    # valid TLS handshake against the domain -- an accurate tool result that
+    # simply doesn't match what this case expected. The site's actual
+    # behavior (not auto-upgrading a plain http:// visit to https) is a
+    # different, more specific claim than "no valid cert," and no current
+    # specialist tool actually tests for that specific redirect behavior.
+    # Re-add a case like this once such a check exists, phrased around what
+    # it actually verifies -- not before.
     {
         "name": "minimal-page-missing-meta-description",
         "url": "https://example.com/",

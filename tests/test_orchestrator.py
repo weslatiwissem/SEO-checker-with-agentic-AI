@@ -446,3 +446,117 @@ class TestStartingKeyIndex:
 
         orchestrator.run_full_audit("https://example.com")  # no starting_key_index passed
         assert captured["key_index"] == 0
+
+
+# --------------------------------------------------------------------------
+# Regression: a category with fabricated findings but no valid score
+# --------------------------------------------------------------------------
+
+class TestRecoverOrDropInvalidScoreCategories:
+    """Reproduces a real bug: when a specialist genuinely fails, the
+    synthesizer/critic could still end up with a category that has
+    findings (sometimes fabricated) but an invalid score, which fails
+    schema validation and would otherwise ship a category showing a
+    None/blank score in the final report."""
+
+    def _log(self):
+        return lambda msg: None
+
+    def test_drops_category_with_findings_but_no_valid_score_when_specialist_also_failed(self):
+        report = {"categories": [{
+            "name": "Technical SEO", "score": None,
+            "findings": [{"severity": "critical", "issue": "Invalid SSL certificate", "recommendation": "Fix it"}],
+        }]}
+        specialist_reports = {
+            "technical_seo": {"category": "technical_seo", "score": None, "findings": [],
+                               "raw_evidence_notes": "This specialist failed to complete..."},
+        }
+        orchestrator._recover_or_drop_empty_categories(report, specialist_reports, self._log())
+        assert report["categories"] == []
+
+    def test_recovers_real_score_when_specialist_score_is_valid(self):
+        report = {"categories": [{
+            "name": "Technical SEO", "score": None,
+            "findings": [{"severity": "warning", "issue": "Missing meta description", "recommendation": "Add one"}],
+        }]}
+        specialist_reports = {
+            "technical_seo": {"category": "technical_seo", "score": 80, "findings": [
+                {"severity": "warning", "issue": "Missing meta description", "recommendation": "Add one"},
+            ]},
+        }
+        orchestrator._recover_or_drop_empty_categories(report, specialist_reports, self._log())
+        assert len(report["categories"]) == 1
+        assert report["categories"][0]["score"] == 80
+
+    def test_keeps_category_untouched_when_findings_and_score_both_already_valid(self):
+        report = {"categories": [{
+            "name": "Technical SEO", "score": 90,
+            "findings": [{"severity": "good", "issue": "All good", "recommendation": ""}],
+        }]}
+        orchestrator._recover_or_drop_empty_categories(report, {}, self._log())
+        assert len(report["categories"]) == 1
+        assert report["categories"][0]["score"] == 90
+
+    def test_final_report_never_has_a_null_score_category_after_reconciliation(self):
+        """End-to-end guard: after both reconciliation steps, no category
+        in the final report should have a non-numeric score -- this is
+        exactly what caused the observed Pydantic schema validation
+        failure in the wild."""
+        report = {"categories": [
+            {"name": "Web Security", "score": 60, "findings": [{"severity": "critical", "issue": "x", "recommendation": "y"}]},
+            {"name": "Technical SEO", "score": None,
+             "findings": [{"severity": "critical", "issue": "Invalid SSL certificate", "recommendation": "Fix it"}]},
+        ]}
+        specialist_reports = {
+            "technical_seo": {"category": "technical_seo", "score": None, "findings": [],
+                               "raw_evidence_notes": "This specialist failed to complete..."},
+        }
+        orchestrator._recover_or_drop_empty_categories(report, specialist_reports, self._log())
+        orchestrator._reconcile_overall_score(report, self._log())
+        for cat in report["categories"]:
+            assert isinstance(cat["score"], (int, float))
+
+
+class TestFailedSpecialistPlaceholderDoesNotLeakRawJson:
+    """Reproduces a real bug: when a specialist fails because the model's
+    JSON was truncated/invalid, the raised error message used to embed
+    that raw, never-successfully-parsed text verbatim into
+    raw_evidence_notes -- which the synthesizer AND critic both then
+    treated as real, validated specialist data (citing specific findings/
+    scores that existed only inside a JSON blob that was never actually
+    parsed)."""
+
+    def test_failure_placeholder_never_contains_raw_json_braces(self):
+        from unittest.mock import patch as mock_patch
+
+        # Simulate the exact failure mode: agent.run() raises with a raw,
+        # truncated JSON blob embedded in the message (as base_agent.py's
+        # ToolAgent.run() actually does on a JSON-repair failure).
+        raw_json_blob = (
+            '[Technical SEO Specialist] model did not return valid JSON after a repair attempt:\n'
+            '{\n  "category": "crawlability and indexability",\n  "score": 0,\n'
+            '  "findings": [\n    { "severity": "critical", "issue": "Invalid SSL certificate", '
+            '"recommendation": "Verify SSL certificate" }\n  ],\n'
+            '  "raw_evidence_notes": "Failed to retrieve HTML"'
+        )
+
+        with mock_patch("agent.orchestrator.run_planner", return_value={"specialists": ["technical_seo"], "reasoning": "t"}), \
+             mock_patch("agent.orchestrator.memory.get_last_audit", return_value=None), \
+             mock_patch("agent.orchestrator.memory.save_audit", return_value=1):
+
+            fake_agent = MagicMock()
+            fake_agent.run.side_effect = RuntimeError(raw_json_blob)
+            fake_agent.tool_call_log = []
+
+            with mock_patch("agent.orchestrator.build_specialist", return_value=fake_agent), \
+                 mock_patch("agent.orchestrator.reflect_and_revise", return_value=(
+                     {"url": "https://example.com", "overall_score": 0.0, "grade": "F", "summary": "s",
+                      "categories": [], "quick_wins": [], "data_limitations": ""},
+                     [{"round": 1, "review": {"approved": True, "issues": [], "instructions_for_revision": ""}}],
+                 )):
+                result = orchestrator.run_full_audit("https://example.com", use_memory=True, mode="quick")
+
+        notes = result["_specialist_reports"]["technical_seo"]["raw_evidence_notes"]
+        assert "{" not in notes
+        assert "Invalid SSL certificate" not in notes
+        assert "failed" in notes.lower()

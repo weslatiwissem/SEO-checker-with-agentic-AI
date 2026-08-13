@@ -392,8 +392,15 @@ class TestSamplingAndKeyRotation:
 
 
 class TestExpandedBenchmarkPool:
-    def test_pool_now_has_at_least_eight_cases(self):
-        assert len(eval_harness.BENCHMARK_CASES) >= 8
+    def test_pool_has_at_least_seven_cases(self):
+        assert len(eval_harness.BENCHMARK_CASES) >= 7
+
+    def test_retired_http_only_case_is_not_in_the_active_pool(self):
+        """http-only-no-tls was removed after a real run falsified its
+        premise (see the comment above BENCHMARK_CASES) -- confirms it
+        doesn't silently reappear."""
+        names = [c["name"] for c in eval_harness.BENCHMARK_CASES]
+        assert "http-only-no-tls" not in names
 
     def test_all_case_names_still_unique_after_expansion(self):
         names = [c["name"] for c in eval_harness.BENCHMARK_CASES]
