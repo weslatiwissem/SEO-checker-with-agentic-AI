@@ -55,3 +55,39 @@ class TestSaveAndRetrieveAudits:
         memory.save_audit("https://www.example.com", {"overall_score": 70, "grade": "C"})
         assert memory.get_last_audit("https://example.com") is None
         assert memory.get_last_audit("https://www.example.com") is not None
+
+
+class TestGetAllFullAudits:
+    def test_returns_full_parsed_reports_with_metadata_merged_in(self, tmp_db_path):
+        memory.save_audit("https://example.com", {
+            "overall_score": 80, "grade": "B", "url": "https://example.com", "categories": [],
+        })
+        reports = memory.get_all_full_audits()
+        assert len(reports) == 1
+        assert reports[0]["overall_score"] == 80
+        assert reports[0]["_domain"] == "example.com"
+        assert "_id" in reports[0]
+        assert "_timestamp" in reports[0]
+
+    def test_returns_across_all_domains_not_just_one(self, tmp_db_path):
+        memory.save_audit("https://a.com", {"overall_score": 50, "grade": "F"})
+        memory.save_audit("https://b.com", {"overall_score": 90, "grade": "A"})
+        reports = memory.get_all_full_audits()
+        assert len(reports) == 2
+
+    def test_empty_history_returns_empty_list(self, tmp_db_path):
+        assert memory.get_all_full_audits() == []
+
+    def test_respects_limit(self, tmp_db_path):
+        for score in [60, 70, 80, 90]:
+            memory.save_audit("https://example.com", {"overall_score": score, "grade": "C"})
+        reports = memory.get_all_full_audits(limit=2)
+        assert len(reports) == 2
+
+    def test_skips_corrupted_row_instead_of_crashing(self, tmp_db_path):
+        memory.save_audit("https://example.com", {"overall_score": 80, "grade": "B"})
+        # Manually corrupt the stored report_json to simulate a bad row.
+        with memory._connect() as conn:
+            conn.execute("UPDATE audits SET report_json = 'not valid json' WHERE id = 1")
+        reports = memory.get_all_full_audits()
+        assert reports == []  # corrupted row skipped, not raised

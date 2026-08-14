@@ -175,12 +175,26 @@ def engineer_feature_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, l
     return X, y, feature_cols
 
 
-def compute_correlations(df: pd.DataFrame) -> list[dict]:
-    """Pearson correlation of each feature against overall_score. Returns a
-    list sorted by absolute correlation strength, descending. Requires at
-    least 3 non-null pairs and some variance per feature to compute a
-    meaningful r; skips (rather than crashing on) constant or all-NaN
-    columns."""
+MIN_RELIABLE_CORRELATION_N = 15  # below this, a correlation's sign/magnitude can flip on 1-2 rows
+
+
+def compute_correlations(df: pd.DataFrame, min_reliable_n: int = MIN_RELIABLE_CORRELATION_N) -> list[dict]:
+    """Pearson correlation of each feature against overall_score. Every
+    feature with >= 3 non-null pairs and some variance is included (nothing
+    is hidden), but each entry is tagged "reliable": n >= min_reliable_n,
+    and the sort puts all reliable results ahead of all unreliable ones
+    (ranked by |r| within each group) rather than sorting by raw |r| alone.
+
+    That distinction matters in practice, not just in theory: with a sparse
+    real dataset (a category whose specialist frequently fails to return
+    valid JSON has very few non-null rows), a small-n correlation is
+    systematically MORE likely to look extreme by pure chance than a
+    well-supported one -- sorting by raw magnitude alone would let that
+    noise rank #1 and crowd out a real, well-supported signal ranked #2.
+    Observed for real: a category with n=8 showed r=-0.857 (a nonsensical
+    negative relationship for a positively-weighted score component) while
+    a category with n=51 showed a sensible r=+0.828 -- sorted by raw |r|,
+    the noisy n=8 result would rank first."""
     if "overall_score" not in df.columns or df["overall_score"].dropna().empty:
         return []
 
@@ -197,9 +211,13 @@ def compute_correlations(df: pd.DataFrame) -> list[dict]:
         results.append({
             "feature": col, "correlation": round(float(r), 3),
             "p_value": round(float(p_value), 4), "n": len(pair),
+            "reliable": len(pair) >= min_reliable_n,
         })
 
-    results.sort(key=lambda item: abs(item["correlation"]), reverse=True)
+    # Reliable results first (sorted by |r| within that group), then
+    # unreliable ones after (also sorted by |r| within their group) --
+    # see the docstring above for why raw-|r| sorting alone is misleading.
+    results.sort(key=lambda item: (not item["reliable"], -abs(item["correlation"])))
     return results
 
 
@@ -333,8 +351,15 @@ def print_analysis_summary(summary: dict) -> None:
         print(f"Using {summary['row_count']} real audit(s) from your history.")
 
     print("\nTop correlations with overall_score:")
-    for c in summary["correlations"][:8]:
-        print(f"  {c['feature']:<32} r={c['correlation']:+.3f}  (p={c['p_value']}, n={c['n']})")
+    shown = summary["correlations"][:8]
+    for c in shown:
+        flag = "" if c["reliable"] else "  [LOW-N, DO NOT TRUST]"
+        print(f"  {c['feature']:<32} r={c['correlation']:+.3f}  (p={c['p_value']}, n={c['n']}){flag}")
+    if any(not c["reliable"] for c in shown):
+        print(f"  Note: [LOW-N] entries have n < {MIN_RELIABLE_CORRELATION_N} -- usually because that "
+              f"category's specialist frequently failed to return valid data. With that few samples, "
+              f"a correlation's sign and magnitude can flip on 1-2 rows and shouldn't be treated as a "
+              f"real finding.")
 
     print("\nModel comparison (cross-validated):")
     print(f"  {'Model':<28}{'R^2':>10}{'MAE':>10}{'RMSE':>10}")

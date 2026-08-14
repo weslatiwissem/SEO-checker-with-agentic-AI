@@ -155,6 +155,71 @@ class TestComputeCorrelations:
         results = analytics.compute_correlations(df)  # should not raise
         assert all(r["feature"] != "x" for r in results)
 
+    def test_low_n_correlation_is_flagged_unreliable(self):
+        df = pd.DataFrame({
+            "sparse_feature": [80, 85, 90] + [np.nan] * 50,
+            "overall_score": list(range(53)),
+        })
+        results = analytics.compute_correlations(df)
+        sparse = next(r for r in results if r["feature"] == "sparse_feature")
+        assert sparse["reliable"] is False
+
+    def test_high_n_correlation_is_flagged_reliable(self):
+        rng = np.random.default_rng(0)
+        n = 40
+        df = pd.DataFrame({"dense_feature": rng.normal(50, 10, n), "overall_score": rng.normal(70, 10, n)})
+        results = analytics.compute_correlations(df, min_reliable_n=15)
+        dense = next(r for r in results if r["feature"] == "dense_feature")
+        assert dense["reliable"] is True
+
+    def test_reliable_result_ranks_above_unreliable_even_with_smaller_raw_correlation(self):
+        """Regression test for a real observed issue: a category present in
+        only 8 of 61 real audits showed r=-0.857 (a nonsensical negative
+        correlation for a positively-weighted score component -- a
+        statistical artifact of the tiny sample), while a category present
+        in 51 of 61 showed a sensible r=+0.828. Sorted by raw |r| alone,
+        the noisy n=8 result ranked #1, ahead of the well-supported n=51
+        result. A well-supported, smaller-magnitude correlation must rank
+        ahead of a large-magnitude, poorly-supported one."""
+        rng = np.random.default_rng(0)
+        n = 61
+        overall = rng.normal(70, 10, n)
+
+        reliable_feature = np.full(n, np.nan)
+        reliable_idx = rng.choice(n, 51, replace=False)
+        reliable_feature[reliable_idx] = overall[reliable_idx] * 0.9 + rng.normal(0, 3, 51)
+
+        unreliable_feature = np.full(n, np.nan)
+        unreliable_idx = rng.choice(n, 8, replace=False)
+        unreliable_feature[unreliable_idx] = 100 - overall[unreliable_idx] + rng.normal(0, 2, 8)
+
+        df = pd.DataFrame({
+            "reliable_feature": reliable_feature,
+            "unreliable_feature": unreliable_feature,
+            "overall_score": overall,
+        })
+        results = analytics.compute_correlations(df)
+
+        # The unreliable one must have the larger raw magnitude (that's the
+        # whole point of this test setup) ...
+        unreliable = next(r for r in results if r["feature"] == "unreliable_feature")
+        reliable = next(r for r in results if r["feature"] == "reliable_feature")
+        assert abs(unreliable["correlation"]) > abs(reliable["correlation"])
+
+        # ... but it must NOT rank first.
+        assert results[0]["feature"] == "reliable_feature"
+        assert results[0]["reliable"] is True
+
+    def test_all_correlations_still_included_nothing_hidden(self):
+        """Unreliable results are de-prioritized in ranking, never removed
+        -- full transparency, matching the rest of this project's ethos."""
+        df = pd.DataFrame({
+            "sparse_feature": [80, 85, 90] + [np.nan] * 50,
+            "overall_score": list(range(53)),
+        })
+        results = analytics.compute_correlations(df)
+        assert any(r["feature"] == "sparse_feature" for r in results)
+
 
 class TestTrainAndCompareModels:
     def test_returns_all_four_models(self):
@@ -278,3 +343,23 @@ class TestPrintAnalysisSummary:
         analytics.print_analysis_summary(summary)
         captured = capsys.readouterr()
         assert "SYNTHETIC" in captured.out
+
+    def test_low_n_correlation_warning_is_visible_in_output(self, capsys, monkeypatch):
+        def fake_run_analysis_result():
+            return {
+                "ok": True, "used_synthetic": False, "real_row_count": 61, "row_count": 61,
+                "feature_count": 2,
+                "correlations": [
+                    {"feature": "score__Technical SEO", "correlation": 0.828, "p_value": 0.0, "n": 51, "reliable": True},
+                    {"feature": "score__Best Practices", "correlation": -0.857, "p_value": 0.0066, "n": 8, "reliable": False},
+                ],
+                "model_comparison": [
+                    {"model": "Ridge", "r2_mean": 0.8, "r2_std": 0.1, "mae_mean": 3.0, "rmse_mean": 4.0},
+                ],
+                "feature_importance": [{"feature": "score__Technical SEO", "importance": 0.5}],
+                "best_model": "Ridge",
+            }
+        analytics.print_analysis_summary(fake_run_analysis_result())
+        captured = capsys.readouterr()
+        assert "LOW-N" in captured.out
+        assert "do not trust" in captured.out.lower() or "shouldn't be treated as a" in captured.out.lower()
