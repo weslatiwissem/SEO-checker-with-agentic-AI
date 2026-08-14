@@ -12,7 +12,7 @@ open-weight models) — no paid model provider required. Hardened through
 extensive real-world testing against live sites (Wikipedia, YouTube, Apple,
 Samsung, Internet Archive's blog, YouTube Music, and others) to survive both
 Groq's free-tier limits and the kinds of mistakes LLMs make when asked to
-self-report facts and do arithmetic. Backed by a 235-test automated `pytest`
+self-report facts and do arithmetic. Backed by a 241-test automated `pytest`
 suite and a self-grading eval harness that runs the real pipeline against
 known-issue benchmark sites (see Testing / Eval harness below).
 
@@ -212,12 +212,42 @@ current design exists because of a specific bug caught this way:
   eval harness passes a different one per sampled case (round-robin) — so
   more configured keys now directly buys headroom to sample more benchmark
   sites per run without concentrating load on a single key.
+- **A failed specialist's raw, never-successfully-parsed JSON was leaking
+  into the synthesizer/critic as if it were real data.** When a specialist's
+  JSON repair attempt still failed, the resulting error message embeds the
+  model's raw, truncated JSON text (useful for a human reading the log) —
+  but that same text was also getting copied verbatim into the failure
+  placeholder's `raw_evidence_notes`. Both the synthesizer and the critic
+  then treated quoted "findings" inside that never-parsed blob as if they
+  were validated specialist data: on one real run, the critic cited a
+  specific score and finding count for a category whose specialist had
+  *completely failed*, because that exact text happened to appear inside
+  the failure message. Fixed by replacing the raw error text with a short,
+  explicitly-non-data message when building the failure placeholder.
+- **A category could ship with real-looking findings but a `null` score.**
+  Downstream of the bug above: a category built partly from a failed
+  specialist's leaked text could have findings but no valid score, which
+  failed Pydantic schema validation and would otherwise show a category
+  with a blank score in the final report.
+  `orchestrator.py::_recover_or_drop_empty_categories` previously only
+  checked for *empty findings*; it now also validates `score`
+  independently, recovering the specialist's real score when available and
+  dropping the whole category (even if it has findings) when the specialist
+  itself never provided a valid score either.
+- **A benchmark case's own premise turned out to be wrong.** The
+  `http-only-no-tls` eval harness case assumed "this site never redirects
+  http:// to https://" meant "has no valid SSL/TLS available" — but a real
+  run showed `check_ssl_certificate` completing a genuinely valid TLS
+  handshake against the domain, an accurate tool result that simply didn't
+  match the site's actual (different, more specific) behavior. Removed
+  rather than left in as a permanent false-negative generator — see the
+  comment above `BENCHMARK_CASES` in `eval_harness.py`.
 
 These bugs (and the compaction/key-rotation improvements) were all found by
 actually running the pipeline against real live sites (blog.archive.org,
-samsung.com, apple.com, pathe.tn) after each change and reading the output
-closely — not just by adding a feature and assuming a clean first run meant
-it worked.
+samsung.com, apple.com, pathe.tn, and the eval harness's own benchmark
+sites) after each change and reading the output closely — not just by
+adding a feature and assuming a clean first run meant it worked.
 
 The net effect: the LLM layer is treated as a fallible reasoning engine that
 proposes findings, while anything that can be verified or computed outright
@@ -288,7 +318,7 @@ guardrails were added instead of just asking more firmly.
    findings and overlong free-text fields — so the first request has a real
    chance of succeeding instead of needing a 413 round-trip to find out it
    was too big.
-10. **Automated regression test suite** — 235 `pytest` tests covering every
+10. **Automated regression test suite** — 241 `pytest` tests covering every
     deterministic reconciliation function, every tool implementation
     (network fully mocked), the retry/rate-limit engine, the reflection
     loop (including a dedicated regression test for a specific,
@@ -404,7 +434,7 @@ seo_agent/
 │                               findings first and truncates overlong free-text fields, so
 │                               the first request has a real chance of succeeding instead of
 │                               relying on base_agent.py's reactive 413-triggered shrinking
-└── tests/                     235 pytest tests -- see "Testing" below
+└── tests/                     241 pytest tests -- see "Testing" below
     ├── conftest.py             shared fixtures: fake Groq client/errors, sample report data
     ├── test_base_agent.py      retry/backoff/rate-limit engine, the tool-call loop
     ├── test_compaction.py      proactive payload trimming, incl. the actual synthesizer/
@@ -479,7 +509,7 @@ CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).
 
 ```bash
 pip install pytest   # already in requirements.txt
-pytest                # runs all 235 tests, ~10-25s, zero network/API calls
+pytest                # runs all 241 tests, ~10-25s, zero network/API calls
 ```
 
 Every test mocks the Groq client and any network calls (`requests.get`,
@@ -505,8 +535,8 @@ out specifically:
 ## Eval harness
 
 ```bash
-python main.py eval                                        # random 4-of-8 sample (default)
-python main.py eval --sample-size 8                         # run the whole pool
+python main.py eval                                        # random 4-of-7 sample (default)
+python main.py eval --sample-size 7                         # run the whole pool
 python main.py eval --sample-size 3 --seed 123               # reproduce an exact past sample
 python main.py eval --mode auto --out results.json           # more thorough, more expensive
 ```
@@ -523,11 +553,21 @@ a "representative" site that could change tomorrow:
 | `wrong-hostname-ssl-certificate` | `wrong.host.badssl.com` | cert issued for a different domain |
 | `untrusted-root-ssl-certificate` | `untrusted-root.badssl.com` | signed by an untrusted CA |
 | `no-encryption-null-cipher` | `null.badssl.com` | refuses real encryption |
-| `http-only-no-tls` | `neverssl.com` | never redirects to HTTPS |
 | `minimal-page-missing-meta-description` | `example.com` | no meta description tag |
 | `minimal-historical-page` | `info.cern.ch` | no meta description tag |
 
-By default, each run randomly samples 4 of these 8 (`DEFAULT_SAMPLE_SIZE`
+An earlier `http-only-no-tls` case (`neverssl.com`) was **removed** after a
+real eval run falsified its premise: the case assumed "never redirects
+http:// to https://" meant "has no valid SSL/TLS," but a real run showed
+`check_ssl_certificate` completing a genuinely valid TLS handshake against
+the domain — an accurate tool result that just didn't match what the case
+expected. No current specialist tool actually tests "does this URL
+auto-upgrade to https," so there was no honest `expected_findings` to write
+for the site's real behavior. See the comment above `BENCHMARK_CASES` in
+`eval_harness.py` for the full reasoning if a similar case gets proposed
+again.
+
+By default, each run randomly samples 4 of these 7 (`DEFAULT_SAMPLE_SIZE`
 in `eval_harness.py`) rather than always running the full pool — this
 exercises different combinations across repeated runs (catching a fix that
 happens to work for one site's exact phrasing but not another's) while

@@ -83,3 +83,30 @@ def get_history(url: str, limit: int = 10) -> list[dict]:
             (domain, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_all_full_audits(limit: int | None = None) -> list[dict]:
+    """Return every stored audit's full parsed report (not just the summary
+    columns get_history returns), across all domains -- this is the raw
+    dataset agent/analytics.py trains on. Each report dict gets '_id',
+    '_domain', and '_timestamp' merged in from the row, alongside whatever
+    the report itself already contains (overall_score, grade, categories,
+    etc.)."""
+    init_db()
+    with _connect() as conn:
+        query = "SELECT id, domain, url, timestamp, report_json FROM audits ORDER BY id ASC"
+        if limit is not None:
+            query += f" LIMIT {int(limit)}"
+        rows = conn.execute(query).fetchall()
+
+    reports = []
+    for row in rows:
+        try:
+            report = json.loads(row["report_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue  # skip a corrupted row rather than crash the whole dataset load
+        report["_id"] = row["id"]
+        report["_domain"] = row["domain"]
+        report["_timestamp"] = row["timestamp"]
+        reports.append(report)
+    return reports

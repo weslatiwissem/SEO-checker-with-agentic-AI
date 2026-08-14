@@ -20,6 +20,7 @@ from agent import run_full_audit
 from agent import memory
 from agent.report_pdf import export_report_pdf
 from agent.eval_harness import run_eval, print_eval_summary
+from agent.analytics import run_analysis, print_analysis_summary
 
 
 def _log(msg: str) -> None:
@@ -117,6 +118,17 @@ def cmd_eval(args):
         sys.exit(1)
 
 
+def cmd_analyze(args):
+    summary = run_analysis(source=args.source, n_synthetic=args.n_synthetic, log_fn=_log)
+    print_analysis_summary(summary)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Full JSON results written to {args.out}")
+    if not summary.get("ok"):
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-agent SEO & website health checker")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -153,6 +165,17 @@ def main():
     p_eval.add_argument("--out", help="Write full JSON results to this file", default=None)
     p_eval.add_argument("--quiet", action="store_true", help="Suppress live agent activity log")
     p_eval.set_defaults(func=cmd_eval)
+
+    p_analyze = sub.add_parser("analyze", help="Classical ML / statistical analysis of your audit history")
+    p_analyze.add_argument("--source", choices=["auto", "real", "synthetic"], default="auto",
+                            help="auto (default): use real audit history if there's enough "
+                                 "(>=20 rows), else fall back to a clearly-labeled synthetic "
+                                 "dataset. real: force real data even if sparse. synthetic: "
+                                 "always use the synthetic generator.")
+    p_analyze.add_argument("--n-synthetic", type=int, default=200,
+                            help="How many synthetic rows to generate if synthetic data is used")
+    p_analyze.add_argument("--out", help="Write full JSON results to this file", default=None)
+    p_analyze.set_defaults(func=cmd_analyze)
 
     args = parser.parse_args()
     args.func(args)
