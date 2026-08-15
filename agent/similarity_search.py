@@ -222,7 +222,15 @@ def build_index(
 
 def search(index: FindingsIndex, query: str, top_k: int = 5, category: str | None = None) -> list[dict]:
     """Return the top_k most similar findings to `query`, each with a
-    similarity score and full source metadata."""
+    similarity score and full source metadata.
+
+    Deduplicates by content (normalized issue+recommendation text), keeping
+    only the highest-similarity occurrence of any given finding text --
+    without this, re-auditing the same site repeatedly means top_k fills up
+    with literal duplicates of that site's most common finding (observed in
+    the wild: two identical "Missing meta description" entries from two
+    audit dates of the same domain occupied 2 of 5 result slots), crowding
+    out genuinely different findings that would give more varied guidance."""
     if index.backend == "embedding":
         query_vec = index.embedder.encode([query], normalize_embeddings=True)
     else:
@@ -232,10 +240,15 @@ def search(index: FindingsIndex, query: str, top_k: int = 5, category: str | Non
     ranked = sorted(range(len(index.corpus)), key=lambda i: sims[i], reverse=True)
 
     results = []
+    seen_texts = set()
     for i in ranked:
         entry = index.corpus[i]
         if category and entry.get("category") != category:
             continue
+        dedup_key = _entry_text(entry).strip().lower()
+        if dedup_key in seen_texts:
+            continue
+        seen_texts.add(dedup_key)
         results.append({
             "similarity": round(float(sims[i]), 4),
             "category": entry.get("category"),

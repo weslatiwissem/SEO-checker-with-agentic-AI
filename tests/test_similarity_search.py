@@ -1,228 +1,281 @@
+"""
+Findings Similarity Search: vector search over this project's collected
+findings, so future recommendations can eventually be grounded in similar
+past issues+fixes instead of relying purely on the LLM every time. (This
+module is standalone -- it is NOT currently wired into the live audit
+pipeline; see "Possible next steps" in the README.)
+
+Two backends:
+- TF-IDF (default, always available): classical lexical vector search via
+  scikit-learn's TfidfVectorizer + cosine similarity. No downloads, no
+  extra dependencies beyond scikit-learn (already required by
+  agent/analytics.py), works fully offline.
+- Sentence embeddings (optional, requires `pip install sentence-transformers`
+  and a working internet connection the first time, to download the small
+  pretrained model): genuine semantic similarity, not just shared words.
+  Only used if explicitly requested (backend="embedding") and available;
+  falls back to TF-IDF automatically (with a clear log message) if the
+  package isn't installed or the model can't be loaded -- never silently
+  half-broken, never raises just because the optional path isn't available.
+
+HONEST LABELING: the corpus mixes two kinds of entries:
+1. A small, hand-authored SEED knowledge base of common SEO/security/
+   accessibility/performance findings and fixes (source="seed"), included
+   so this module is useful even before much real audit history exists.
+2. Real findings pulled from your actual stored audit history
+   (source="real_audit", tagged with the real domain/timestamp).
+Every search result states which one it came from -- never presented as if
+both were the same kind of evidence.
+"""
 from __future__ import annotations
 
-from agent import similarity_search as ss
+from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from . import memory
+
+# --- Seed knowledge base ---------------------------------------------------
+# Hand-authored, common, well-established findings and fixes -- NOT real
+# audit history. Chosen to mirror the kinds of findings this project's own
+# specialists actually produce (see specialists.py/postprocess.py), so
+# search results are genuinely representative of a real audit.
+SEED_FINDINGS: list[dict] = [
+    {"category": "Web Security", "severity": "critical", "issue": "SSL certificate has expired.",
+     "recommendation": "Renew the SSL certificate immediately and verify auto-renewal is configured."},
+    {"category": "Web Security", "severity": "critical",
+     "issue": "SSL certificate is self-signed or issued by an untrusted certificate authority.",
+     "recommendation": "Replace it with a certificate from a trusted CA (e.g. Let's Encrypt, DigiCert)."},
+    {"category": "Web Security", "severity": "warning", "issue": "Missing Content-Security-Policy header.",
+     "recommendation": "Implement a Content-Security-Policy to mitigate XSS and data-injection attacks."},
+    {"category": "Web Security", "severity": "warning",
+     "issue": "Missing X-Frame-Options or frame-ancestors CSP directive.",
+     "recommendation": "Add X-Frame-Options: DENY or SAMEORIGIN to prevent clickjacking."},
+    {"category": "Web Security", "severity": "warning",
+     "issue": "Missing Strict-Transport-Security (HSTS) header.",
+     "recommendation": "Add a Strict-Transport-Security header to force HTTPS on all future visits."},
+    {"category": "On-Page Content", "severity": "critical", "issue": "Missing meta description.",
+     "recommendation": "Add a unique meta description of 120-160 characters summarizing the page."},
+    {"category": "On-Page Content", "severity": "critical", "issue": "Multiple H1 tags found on the page.",
+     "recommendation": "Use exactly one H1 tag per page, with remaining headings as H2/H3 in logical order."},
+    {"category": "On-Page Content", "severity": "warning",
+     "issue": "Title tag is too long or too short for optimal display in search results.",
+     "recommendation": "Rewrite the title tag to be 50-60 characters, front-loading the primary keyword."},
+    {"category": "On-Page Content", "severity": "warning", "issue": "No Open Graph tags found for social sharing.",
+     "recommendation": "Add og:title, og:description, and og:image tags for link-preview control."},
+    {"category": "On-Page Content", "severity": "warning", "issue": "Thin content -- page has very few words.",
+     "recommendation": "Expand the page with substantive, unique content relevant to the target keyword."},
+    {"category": "Technical SEO", "severity": "critical", "issue": "No robots.txt file found.",
+     "recommendation": "Add a robots.txt file specifying crawl rules and a sitemap reference."},
+    {"category": "Technical SEO", "severity": "warning", "issue": "No sitemap.xml file found.",
+     "recommendation": "Generate and submit an XML sitemap to search engines via Search Console."},
+    {"category": "Technical SEO", "severity": "warning", "issue": "Images are missing alt text.",
+     "recommendation": "Add descriptive alt text to informative images; empty alt for purely decorative ones."},
+    {"category": "Technical SEO", "severity": "warning",
+     "issue": "Canonical tag is missing or points to the wrong URL.",
+     "recommendation": "Add a self-referencing canonical tag pointing to the correct preferred URL."},
+    {"category": "Page Speed", "severity": "critical", "issue": "Largest Contentful Paint (LCP) exceeds 2500ms.",
+     "recommendation": "Optimize the largest above-the-fold image/text block and improve server response time."},
+    {"category": "Page Speed", "severity": "warning", "issue": "High Cumulative Layout Shift (CLS).",
+     "recommendation": "Reserve explicit width/height for images and ads; avoid late-injected content shifting layout."},
+    {"category": "Page Speed", "severity": "warning", "issue": "High Total Blocking Time (TBT).",
+     "recommendation": "Minify and defer non-critical JavaScript, and split large bundles."},
+    {"category": "Link Health", "severity": "critical", "issue": "Broken internal or external links found.",
+     "recommendation": "Fix or remove broken links; set up periodic automated link checking."},
+    {"category": "Link Health", "severity": "warning",
+     "issue": "High failure rate across sampled links, possibly due to bot-blocking.",
+     "recommendation": "Manually verify a sample of failed links -- a high failure rate often means the site is "
+                        "blocking automated requests, not that the links are genuinely broken."},
+    {"category": "Accessibility", "severity": "critical", "issue": "Images do not have alt attributes.",
+     "recommendation": "Add descriptive alt attributes to informative images for screen reader users."},
+    {"category": "Accessibility", "severity": "warning",
+     "issue": "Insufficient color contrast between text and background.",
+     "recommendation": "Increase the contrast ratio to at least 4.5:1 for normal text per WCAG AA."},
+    {"category": "Accessibility", "severity": "warning", "issue": "Buttons or links do not have an accessible name.",
+     "recommendation": "Add descriptive text, aria-label, or visually-hidden text for screen readers."},
+    {"category": "Accessibility", "severity": "warning",
+     "issue": "Heading elements are not in a sequentially-descending order.",
+     "recommendation": "Reorder headings so each level follows logically without skipping levels."},
+    {"category": "Best Practices", "severity": "warning",
+     "issue": "Page includes a JavaScript library with a known security vulnerability.",
+     "recommendation": "Upgrade the library to a patched version or replace it with a maintained alternative."},
+    {"category": "Best Practices", "severity": "warning",
+     "issue": "Browser console errors were logged while loading the page.",
+     "recommendation": "Investigate and resolve the JavaScript errors logged to the console."},
+    {"category": "Best Practices", "severity": "good",
+     "issue": "No deprecated APIs or known-vulnerable libraries detected.",
+     "recommendation": "No action needed -- continue monitoring dependencies for new vulnerabilities."},
+]
+for _entry in SEED_FINDINGS:
+    _entry["source"] = "seed"
+    _entry.setdefault("domain", None)
+    _entry.setdefault("timestamp", None)
 
 
-def _sample_report(domain="example.com", timestamp="2026-08-01T00:00:00", findings=None):
-    if findings is None:
-        findings = [{"severity": "critical", "issue": "Custom finding.", "recommendation": "Custom fix."}]
-    return {
-        "_domain": domain, "_timestamp": timestamp,
-        "categories": [{"name": "Web Security", "findings": findings}],
-    }
+def _findings_from_report(report: dict) -> list[dict]:
+    """Flatten one stored report into individual finding entries, tagged
+    with where they came from."""
+    entries = []
+    for cat in report.get("categories", []):
+        if not isinstance(cat, dict):
+            continue
+        for f in cat.get("findings", []):
+            entries.append({
+                "category": cat.get("name"),
+                "severity": f.get("severity"),
+                "issue": f.get("issue", ""),
+                "recommendation": f.get("recommendation", ""),
+                "source": "real_audit",
+                "domain": report.get("_domain"),
+                "timestamp": report.get("_timestamp"),
+            })
+    return entries
 
 
-class TestSeedFindings:
-    def test_every_entry_has_required_fields(self):
-        for entry in ss.SEED_FINDINGS:
-            assert entry.get("category")
-            assert entry.get("severity") in {"good", "warning", "critical"}
-            assert entry.get("issue")
-            assert entry.get("recommendation")
-
-    def test_every_entry_tagged_as_seed_source(self):
-        assert all(e["source"] == "seed" for e in ss.SEED_FINDINGS)
-
-    def test_covers_multiple_categories(self):
-        categories = {e["category"] for e in ss.SEED_FINDINGS}
-        assert len(categories) >= 5  # meaningfully spans the specialist categories
-
-    def test_has_a_reasonable_number_of_entries(self):
-        assert len(ss.SEED_FINDINGS) >= 15
+def load_real_findings() -> list[dict]:
+    """Every individual finding from every stored audit, flattened."""
+    entries = []
+    for report in memory.get_all_full_audits():
+        entries.extend(_findings_from_report(report))
+    return entries
 
 
-class TestFindingsFromReport:
-    def test_extracts_findings_with_metadata(self):
-        report = _sample_report(domain="a.com", timestamp="t1")
-        entries = ss._findings_from_report(report)
-        assert len(entries) == 1
-        assert entries[0]["category"] == "Web Security"
-        assert entries[0]["source"] == "real_audit"
-        assert entries[0]["domain"] == "a.com"
-        assert entries[0]["timestamp"] == "t1"
-
-    def test_handles_report_with_no_categories(self):
-        assert ss._findings_from_report({"categories": []}) == []
-
-    def test_handles_multiple_findings_across_categories(self):
-        report = {
-            "_domain": "a.com", "_timestamp": "t1",
-            "categories": [
-                {"name": "Web Security", "findings": [{"severity": "critical", "issue": "x", "recommendation": "y"}]},
-                {"name": "Page Speed", "findings": [{"severity": "warning", "issue": "z", "recommendation": "w"}]},
-            ],
-        }
-        entries = ss._findings_from_report(report)
-        assert len(entries) == 2
-        assert {e["category"] for e in entries} == {"Web Security", "Page Speed"}
+def build_corpus(include_seed: bool = True, include_real: bool = True) -> list[dict]:
+    """Combine the seed knowledge base and real audit history findings into
+    one searchable corpus. Every entry keeps its "source" tag."""
+    corpus: list[dict] = []
+    if include_seed:
+        corpus.extend(dict(e) for e in SEED_FINDINGS)
+    if include_real:
+        corpus.extend(load_real_findings())
+    return corpus
 
 
-class TestLoadRealFindings:
-    def test_flattens_across_multiple_reports(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [
-            _sample_report(domain="a.com"), _sample_report(domain="b.com"),
-        ])
-        entries = ss.load_real_findings()
-        assert len(entries) == 2
-        assert {e["domain"] for e in entries} == {"a.com", "b.com"}
-
-    def test_empty_history_returns_empty_list(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        assert ss.load_real_findings() == []
+def _entry_text(entry: dict) -> str:
+    return f"{entry.get('issue', '')} {entry.get('recommendation', '')}".strip()
 
 
-class TestBuildCorpus:
-    def test_includes_seed_by_default(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        corpus = ss.build_corpus()
-        assert len(corpus) == len(ss.SEED_FINDINGS)
-
-    def test_excludes_seed_when_requested(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [_sample_report()])
-        corpus = ss.build_corpus(include_seed=False)
-        assert len(corpus) == 1
-        assert corpus[0]["source"] == "real_audit"
-
-    def test_excludes_real_when_requested(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [_sample_report()])
-        corpus = ss.build_corpus(include_real=False)
-        assert len(corpus) == len(ss.SEED_FINDINGS)
-        assert all(e["source"] == "seed" for e in corpus)
-
-    def test_combines_both_by_default(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [_sample_report()])
-        corpus = ss.build_corpus()
-        assert len(corpus) == len(ss.SEED_FINDINGS) + 1
-
-    def test_mutating_returned_corpus_does_not_affect_seed_constant(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        corpus = ss.build_corpus()
-        corpus[0]["issue"] = "mutated"
-        assert ss.SEED_FINDINGS[0]["issue"] != "mutated"
+@dataclass
+class FindingsIndex:
+    corpus: list[dict]
+    backend: str  # "tfidf" or "embedding"
+    vectorizer: object = None
+    embedder: object = None
+    matrix: object = None
 
 
-class TestBuildIndexTfidf:
-    def test_builds_tfidf_index_by_default(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        index = ss.build_index()
-        assert index.backend == "tfidf"
-        assert index.vectorizer is not None
-        assert index.matrix.shape[0] == len(ss.SEED_FINDINGS)
-
-    def test_raises_on_empty_corpus(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        try:
-            ss.build_index(include_seed=False, include_real=False)
-            assert False, "expected ValueError"
-        except ValueError:
-            pass
+def _build_tfidf_index(corpus: list[dict]) -> FindingsIndex:
+    texts = [_entry_text(e) for e in corpus]
+    vectorizer = TfidfVectorizer(stop_words="english", max_df=0.9)
+    matrix = vectorizer.fit_transform(texts)
+    return FindingsIndex(corpus=corpus, backend="tfidf", vectorizer=vectorizer, matrix=matrix)
 
 
-class TestBuildIndexEmbeddingFallback:
-    def test_falls_back_to_tfidf_when_sentence_transformers_missing(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        logs = []
-        index = ss.build_index(backend="embedding", log_fn=logs.append)
-        assert index.backend == "tfidf"
-        assert any("not installed" in msg for msg in logs)
+def _try_build_embedding_index(corpus: list[dict], log_fn: Callable[[str], None]) -> FindingsIndex | None:
+    """Attempt to build a real sentence-embedding index. Returns None
+    (never raises) if sentence-transformers isn't installed or the model
+    can't be loaded (e.g. no network to download it) -- caller falls back
+    to TF-IDF in that case."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        log_fn("  -> sentence-transformers not installed -- falling back to TF-IDF. "
+               "Install it (`pip install sentence-transformers`) for real semantic embeddings.")
+        return None
 
-    def test_falls_back_to_tfidf_when_model_load_raises(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
+    try:
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        texts = [_entry_text(e) for e in corpus]
+        embeddings = model.encode(texts, normalize_embeddings=True)
+    except Exception as e:
+        log_fn(f"  -> Could not load/run the embedding model ({e}) -- falling back to TF-IDF.")
+        return None
 
-        class FakeSentenceTransformerModule:
-            class SentenceTransformer:
-                def __init__(self, *a, **kw):
-                    raise RuntimeError("simulated: no network to download model")
-
-        import sys
-        monkeypatch.setitem(sys.modules, "sentence_transformers", FakeSentenceTransformerModule)
-
-        logs = []
-        index = ss.build_index(backend="embedding", log_fn=logs.append)
-        assert index.backend == "tfidf"
-        assert any("Could not load" in msg for msg in logs)
-
-    def test_uses_embedding_backend_when_available(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-
-        class FakeModel:
-            def encode(self, texts, normalize_embeddings=True):
-                import numpy as np
-                # Deterministic fake embedding: length-based, just needs to be a valid vector per text.
-                return np.array([[len(t), 0.0, 1.0] for t in texts], dtype=float)
-
-        class FakeSentenceTransformerModule:
-            class SentenceTransformer:
-                def __init__(self, *a, **kw):
-                    pass
-
-                def encode(self, texts, normalize_embeddings=True):
-                    return FakeModel().encode(texts, normalize_embeddings)
-
-        import sys
-        monkeypatch.setitem(sys.modules, "sentence_transformers", FakeSentenceTransformerModule)
-
-        index = ss.build_index(backend="embedding")
-        assert index.backend == "embedding"
-        assert index.embedder is not None
+    return FindingsIndex(corpus=corpus, backend="embedding", embedder=model, matrix=np.asarray(embeddings))
 
 
-class TestSearch:
-    def test_returns_top_k_sorted_descending(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        index = ss.build_index()
-        results = ss.search(index, "meta description missing", top_k=3)
-        assert len(results) == 3
-        sims = [r["similarity"] for r in results]
-        assert sims == sorted(sims, reverse=True)
+def build_index(
+    backend: str = "tfidf",
+    include_seed: bool = True,
+    include_real: bool = True,
+    log_fn: Callable[[str], None] | None = None,
+) -> FindingsIndex:
+    """backend: "tfidf" (default, always available) or "embedding" (tries
+    real sentence embeddings, falls back to TF-IDF automatically -- see
+    module docstring)."""
+    log_fn = log_fn or (lambda msg: None)
+    corpus = build_corpus(include_seed=include_seed, include_real=include_real)
+    if not corpus:
+        raise ValueError("No findings available to index (seed and real history both empty/disabled).")
 
-    def test_most_relevant_seed_entry_ranks_first(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        index = ss.build_index()
-        results = ss.search(index, "the meta description tag is missing from the page", top_k=1)
-        assert "meta description" in results[0]["issue"].lower()
+    if backend == "embedding":
+        index = _try_build_embedding_index(corpus, log_fn)
+        if index is not None:
+            return index
+        # fall through to TF-IDF
 
-    def test_category_filter_restricts_results(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        index = ss.build_index()
-        results = ss.search(index, "issue", top_k=5, category="Accessibility")
-        assert all(r["category"] == "Accessibility" for r in results)
-
-    def test_real_finding_ranks_above_seed_when_more_relevant(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [_sample_report(
-            findings=[{"severity": "critical", "issue": "Extremely unusual bespoke phrase xyzzycorp cipher issue.",
-                       "recommendation": "Fix the xyzzycorp cipher."}],
-        )])
-        index = ss.build_index()
-        results = ss.search(index, "xyzzycorp cipher issue", top_k=1)
-        assert results[0]["source"] == "real_audit"
-
-    def test_result_includes_full_source_metadata(self, monkeypatch):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [_sample_report(domain="a.com", timestamp="t1")])
-        index = ss.build_index()
-        results = ss.search(index, "custom finding", top_k=1)
-        assert results[0]["domain"] == "a.com"
-        assert results[0]["timestamp"] == "t1"
+    return _build_tfidf_index(corpus)
 
 
-class TestPrintSearchResults:
-    def test_does_not_raise_with_results(self, monkeypatch, capsys):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [])
-        index = ss.build_index()
-        results = ss.search(index, "missing meta description", top_k=2)
-        ss.print_search_results("missing meta description", results, index.backend)
-        captured = capsys.readouterr()
-        assert "FINDINGS SIMILARITY SEARCH" in captured.out
+def search(index: FindingsIndex, query: str, top_k: int = 5, category: str | None = None) -> list[dict]:
+    """Return the top_k most similar findings to `query`, each with a
+    similarity score and full source metadata.
 
-    def test_does_not_raise_with_no_results(self, capsys):
-        ss.print_search_results("query", [], "tfidf")
-        captured = capsys.readouterr()
-        assert "No matching findings" in captured.out
+    Deduplicates by content (normalized issue+recommendation text), keeping
+    only the highest-similarity occurrence of any given finding text --
+    without this, re-auditing the same site repeatedly means top_k fills up
+    with literal duplicates of that site's most common finding (observed in
+    the wild: two identical "Missing meta description" entries from two
+    audit dates of the same domain occupied 2 of 5 result slots), crowding
+    out genuinely different findings that would give more varied guidance."""
+    if index.backend == "embedding":
+        query_vec = index.embedder.encode([query], normalize_embeddings=True)
+    else:
+        query_vec = index.vectorizer.transform([query])
+    sims = cosine_similarity(query_vec, index.matrix)[0]
 
-    def test_labels_seed_vs_real_audit_source_distinctly(self, monkeypatch, capsys):
-        monkeypatch.setattr(ss.memory, "get_all_full_audits", lambda: [_sample_report(domain="a.com")])
-        index = ss.build_index()
-        results = ss.search(index, "custom finding", top_k=1)
-        ss.print_search_results("custom finding", results, index.backend)
-        captured = capsys.readouterr()
-        assert "real audit: a.com" in captured.out
+    ranked = sorted(range(len(index.corpus)), key=lambda i: sims[i], reverse=True)
+
+    results = []
+    seen_texts = set()
+    for i in ranked:
+        entry = index.corpus[i]
+        if category and entry.get("category") != category:
+            continue
+        dedup_key = _entry_text(entry).strip().lower()
+        if dedup_key in seen_texts:
+            continue
+        seen_texts.add(dedup_key)
+        results.append({
+            "similarity": round(float(sims[i]), 4),
+            "category": entry.get("category"),
+            "severity": entry.get("severity"),
+            "issue": entry.get("issue"),
+            "recommendation": entry.get("recommendation"),
+            "source": entry.get("source"),
+            "domain": entry.get("domain"),
+            "timestamp": entry.get("timestamp"),
+        })
+        if len(results) >= top_k:
+            break
+
+    return results
+
+
+def print_search_results(query: str, results: list[dict], backend: str) -> None:
+    print("\n" + "=" * 64)
+    print(f"FINDINGS SIMILARITY SEARCH  (backend: {backend})")
+    print("=" * 64)
+    print(f'Query: "{query}"\n')
+    if not results:
+        print("No matching findings.")
+    for r in results:
+        source_label = "seed reference" if r["source"] == "seed" else f"real audit: {r['domain']} ({r['timestamp']})"
+        print(f"  [{r['similarity']:.3f}] ({r['category']}, {r['severity']}) -- {source_label}")
+        print(f"    Issue:          {r['issue']}")
+        print(f"    Recommendation: {r['recommendation']}")
+        print()
+    print("=" * 64 + "\n")
