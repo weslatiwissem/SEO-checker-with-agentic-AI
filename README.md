@@ -12,7 +12,7 @@ open-weight models) — no paid model provider required. Hardened through
 extensive real-world testing against live sites (Wikipedia, YouTube, Apple,
 Samsung, Internet Archive's blog, and others) to survive both Groq's
 free-tier limits and the kinds of mistakes LLMs make when asked to
-self-report facts and do arithmetic. Backed by a 290-test automated
+self-report facts and do arithmetic. Backed by a 317-test automated
 `pytest` suite and a self-grading eval harness (see Testing / Eval harness
 below).
 
@@ -186,7 +186,7 @@ clean first run meant it worked.
 9. **Multi-key, multi-model resilience** — automatic model fallback,
    proactive round-robin across all configured keys for the entire run,
    proactive *and* reactive payload shrinking, JSON self-repair retries.
-10. **290-test automated regression suite** — see Testing below.
+10. **317-test automated regression suite** — see Testing below.
 11. **Self-grading eval harness** — runs the real pipeline against a
     randomly-sampled pool of benchmark sites with known, verifiable
     issues, graded in pure Python (no LLM call spent on grading). See Eval
@@ -195,6 +195,10 @@ clean first run meant it worked.
     audit history: feature engineering, Pearson correlation, and
     cross-validated comparison of 4 scikit-learn regressors predicting
     `overall_score`. See Score Analytics below.
+13. **Findings Similarity Search** — vector search (TF-IDF by default;
+    optional real sentence embeddings) over a seed knowledge base plus real
+    audit history, so a past finding/fix can be looked up by meaning rather
+    than exact wording. See Findings Similarity Search below.
 
 ## Setup
 
@@ -238,6 +242,9 @@ python main.py eval
 
 # Classical ML / statistical analysis of your audit history
 python main.py analyze
+
+# Search past findings for ones similar to a new issue
+python main.py similar "page missing meta description"
 ```
 
 Or use it as a library:
@@ -280,8 +287,9 @@ seo_agent/
 │   ├── report_pdf.py          reportlab-based PDF export
 │   ├── eval_harness.py        self-grading eval harness -- see "Eval harness" below
 │   ├── analytics.py           Score Analytics -- see "Score Analytics" below
+│   ├── similarity_search.py   Findings Similarity Search -- see below
 │   └── compaction.py          proactive payload compaction (see "How this project evolved")
-└── tests/                     290 pytest tests -- see "Testing" below
+└── tests/                     317 pytest tests -- see "Testing" below
     ├── conftest.py             shared fixtures: fake Groq client/errors, sample report data
     ├── test_analytics.py       feature engineering, correlations, model training/comparison
     ├── test_base_agent.py      retry/backoff/rate-limit engine, the tool-call loop
@@ -292,6 +300,7 @@ seo_agent/
     ├── test_orchestrator.py    score/weight reconciliation, category recovery, pipeline wiring
     ├── test_postprocess.py     every deterministic reconciliation function
     ├── test_schemas.py         the Pydantic report contract
+    ├── test_similarity_search.py  corpus building, TF-IDF search, embedding fallback
     └── test_tools.py           every tool implementation, network fully mocked
 ```
 
@@ -356,7 +365,7 @@ CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).
 
 ```bash
 pip install pytest   # already in requirements.txt
-pytest                # runs all 290 tests, zero network/API calls
+pytest                # runs all 317 tests, zero network/API calls
 ```
 
 Every test mocks the Groq client and any network calls — the suite runs
@@ -449,6 +458,39 @@ verifiable weighted-sum generative formula) so the module is genuinely
 runnable and testable before real data accumulates. Every output states
 explicitly whether it used real or synthetic data — never silently.
 
+## Findings Similarity Search
+
+```bash
+python main.py similar "page missing meta description"
+python main.py similar "weak TLS cipher" --category "Web Security" --top-k 3
+python main.py similar "slow page load" --backend embedding   # real semantic search, if available
+```
+
+Vector search over collected findings, so a similar past issue+fix can be
+looked up by meaning instead of exact wording. Standalone (`agent/
+similarity_search.py`) — **not currently wired into the live audit
+pipeline**; see Possible next steps.
+
+Two backends, both in `build_index()`:
+- **TF-IDF** (default) — classical lexical vector search via scikit-learn,
+  no downloads, always available.
+- **Sentence embeddings** (`--backend embedding`) — genuine semantic
+  similarity via `sentence-transformers`, if installed and a model can be
+  downloaded. Falls back to TF-IDF automatically, with a clear log
+  message, if either isn't available — never raises just because the
+  optional path is missing.
+
+The searchable corpus mixes two clearly-labeled kinds of entries: a small,
+hand-authored **seed knowledge base** (~26 common findings/fixes across all
+7 categories, so this is useful before much real history exists) and real
+findings pulled from your stored audit history. Every search result states
+which one it came from.
+
+**Honest limitation:** TF-IDF matches shared vocabulary, not meaning — a
+query like "takes forever to load" won't match a finding about "Largest
+Contentful Paint" the way a real embedding model would. Install
+`sentence-transformers` for genuine semantic matching.
+
 ## Honest limitations
 
 - No JavaScript rendering for HTML parsing (though real Core Web Vitals do
@@ -483,8 +525,8 @@ explicitly whether it used real or synthetic data — never silently.
 - Keep growing the eval harness's benchmark pool (now 7) and Score
   Analytics' real dataset (currently well under the 20-row threshold for
   trustworthy real-data analysis) as more audits accumulate.
-- Add embeddings/vector search over historical findings/recommendations,
-  so recommendations can be grounded in retrieved similar past fixes
-  instead of relying purely on the LLM each time.
+- Wire Findings Similarity Search into the live pipeline — e.g. giving the
+  synthesizer retrieved similar past fixes as grounding context instead of
+  writing recommendations from scratch each time.
 - Hook `python main.py eval` (and `analyze`) into CI so a regression gets
   caught automatically, not just when someone notices in a manual run.

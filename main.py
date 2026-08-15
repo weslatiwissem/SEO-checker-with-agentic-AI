@@ -21,6 +21,7 @@ from agent import memory
 from agent.report_pdf import export_report_pdf
 from agent.eval_harness import run_eval, print_eval_summary
 from agent.analytics import run_analysis, print_analysis_summary
+from agent.similarity_search import build_index, search, print_search_results
 
 
 def _log(msg: str) -> None:
@@ -129,6 +130,21 @@ def cmd_analyze(args):
         sys.exit(1)
 
 
+def cmd_similar(args):
+    index = build_index(
+        backend=args.backend,
+        include_seed=not args.no_seed,
+        include_real=not args.no_real,
+        log_fn=_log,
+    )
+    results = search(index, args.query, top_k=args.top_k, category=args.category)
+    print_search_results(args.query, results, index.backend)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump({"query": args.query, "backend": index.backend, "results": results}, f, indent=2)
+        print(f"Full JSON results written to {args.out}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-agent SEO & website health checker")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -176,6 +192,20 @@ def main():
                             help="How many synthetic rows to generate if synthetic data is used")
     p_analyze.add_argument("--out", help="Write full JSON results to this file", default=None)
     p_analyze.set_defaults(func=cmd_analyze)
+
+    p_similar = sub.add_parser("similar", help="Search past findings for ones similar to a query")
+    p_similar.add_argument("query", help="Text describing the issue you're looking for similar past findings on")
+    p_similar.add_argument("--backend", choices=["tfidf", "embedding"], default="tfidf",
+                            help="tfidf (default): always available, lexical similarity. embedding: real "
+                                 "semantic similarity, requires `pip install sentence-transformers` and a "
+                                 "one-time model download; falls back to tfidf automatically if unavailable.")
+    p_similar.add_argument("--top-k", type=int, default=5, help="How many results to show")
+    p_similar.add_argument("--category", default=None,
+                            help='Restrict results to one category, e.g. "Web Security"')
+    p_similar.add_argument("--no-seed", action="store_true", help="Exclude the built-in seed knowledge base")
+    p_similar.add_argument("--no-real", action="store_true", help="Exclude your real audit history")
+    p_similar.add_argument("--out", help="Write full JSON results to this file", default=None)
+    p_similar.set_defaults(func=cmd_similar)
 
     args = parser.parse_args()
     args.func(args)
