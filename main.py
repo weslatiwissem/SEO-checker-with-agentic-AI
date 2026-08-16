@@ -22,6 +22,7 @@ from agent.report_pdf import export_report_pdf
 from agent.eval_harness import run_eval, print_eval_summary
 from agent.analytics import run_analysis, print_analysis_summary
 from agent.similarity_search import build_index, search, print_search_results
+from agent.critic_predictor import run_analysis as run_approval_analysis, print_analysis_summary as print_approval_summary
 
 
 def _log(msg: str) -> None:
@@ -145,6 +146,17 @@ def cmd_similar(args):
         print(f"Full JSON results written to {args.out}")
 
 
+def cmd_predict_approval(args):
+    summary = run_approval_analysis(source=args.source, n_synthetic=args.n_synthetic, log_fn=_log)
+    print_approval_summary(summary)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Full JSON results written to {args.out}")
+    if not summary.get("ok"):
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-agent SEO & website health checker")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -206,6 +218,15 @@ def main():
     p_similar.add_argument("--no-real", action="store_true", help="Exclude your real audit history")
     p_similar.add_argument("--out", help="Write full JSON results to this file", default=None)
     p_similar.set_defaults(func=cmd_similar)
+
+    p_predict = sub.add_parser("predict-approval",
+                                help="Train a small classifier predicting critic approval from audit history")
+    p_predict.add_argument("--source", choices=["auto", "real", "synthetic"], default="auto",
+                            help="Same fallback behavior as `analyze` -- see its --help.")
+    p_predict.add_argument("--n-synthetic", type=int, default=200,
+                            help="How many synthetic rows to generate if synthetic data is used")
+    p_predict.add_argument("--out", help="Write full JSON results to this file", default=None)
+    p_predict.set_defaults(func=cmd_predict_approval)
 
     args = parser.parse_args()
     args.func(args)

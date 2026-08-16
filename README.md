@@ -12,7 +12,7 @@ open-weight models) — no paid model provider required. Hardened through
 extensive real-world testing against live sites (Wikipedia, YouTube, Apple,
 Samsung, Internet Archive's blog, and others) to survive both Groq's
 free-tier limits and the kinds of mistakes LLMs make when asked to
-self-report facts and do arithmetic. Backed by a 317-test automated
+self-report facts and do arithmetic. Backed by a 348-test automated
 `pytest` suite and a self-grading eval harness (see Testing / Eval harness
 below).
 
@@ -186,7 +186,7 @@ clean first run meant it worked.
 9. **Multi-key, multi-model resilience** — automatic model fallback,
    proactive round-robin across all configured keys for the entire run,
    proactive *and* reactive payload shrinking, JSON self-repair retries.
-10. **317-test automated regression suite** — see Testing below.
+10. **348-test automated regression suite** — see Testing below.
 11. **Self-grading eval harness** — runs the real pipeline against a
     randomly-sampled pool of benchmark sites with known, verifiable
     issues, graded in pure Python (no LLM call spent on grading). See Eval
@@ -199,6 +199,11 @@ clean first run meant it worked.
     optional real sentence embeddings) over a seed knowledge base plus real
     audit history, so a past finding/fix can be looked up by meaning rather
     than exact wording. See Findings Similarity Search below.
+14. **Critic-Approval Predictor** — a small classifier trained from scratch
+    on real audit history, predicting whether the critic will approve a
+    draft. Honestly scoped: this is genuine classical-ML training on this
+    project's own data, not a rebranded LLM fine-tune Groq's API can't do
+    anyway. See Critic-Approval Predictor below.
 
 ## Setup
 
@@ -245,6 +250,9 @@ python main.py analyze
 
 # Search past findings for ones similar to a new issue
 python main.py similar "page missing meta description"
+
+# Train a classifier predicting whether the critic will approve a draft
+python main.py predict-approval
 ```
 
 Or use it as a library:
@@ -288,13 +296,15 @@ seo_agent/
 │   ├── eval_harness.py        self-grading eval harness -- see "Eval harness" below
 │   ├── analytics.py           Score Analytics -- see "Score Analytics" below
 │   ├── similarity_search.py   Findings Similarity Search -- see below
+│   ├── critic_predictor.py    Critic-Approval Predictor -- see below
 │   └── compaction.py          proactive payload compaction (see "How this project evolved")
-└── tests/                     317 pytest tests -- see "Testing" below
+└── tests/                     348 pytest tests -- see "Testing" below
     ├── conftest.py             shared fixtures: fake Groq client/errors, sample report data
     ├── test_analytics.py       feature engineering, correlations, model training/comparison
     ├── test_base_agent.py      retry/backoff/rate-limit engine, the tool-call loop
     ├── test_compaction.py      proactive payload trimming, incl. actual wiring
     ├── test_critic.py          reflection loop, incl. a dedicated regression test
+    ├── test_critic_predictor.py  classification feature engineering, class balance, classifier comparison
     ├── test_eval_harness.py    eval harness grading logic (run_full_audit fully mocked)
     ├── test_memory.py          SQLite persistence
     ├── test_orchestrator.py    score/weight reconciliation, category recovery, pipeline wiring
@@ -365,7 +375,7 @@ CLI-only: `--mode {quick,deep,auto}` on `audit` and `eval` (see Usage above).
 
 ```bash
 pip install pytest   # already in requirements.txt
-pytest                # runs all 317 tests, zero network/API calls
+pytest                # runs all 348 tests, zero network/API calls
 ```
 
 Every test mocks the Groq client and any network calls — the suite runs
@@ -491,6 +501,43 @@ query like "takes forever to load" won't match a finding about "Largest
 Contentful Paint" the way a real embedding model would. Install
 `sentence-transformers` for genuine semantic matching.
 
+## Critic-Approval Predictor
+
+```bash
+python main.py predict-approval                 # real data if >=20 audits, else synthetic
+python main.py predict-approval --source real     # force real data even if sparse
+```
+
+A small classifier (`agent/critic_predictor.py`) trained from scratch to
+predict whether the critic will approve a draft, using the real
+`review_status` every stored audit already has as the training label.
+
+**Honest scoping, precisely stated:** "fine-tuning llama-3.3-70b" isn't a
+real option — Groq is an inference API, not a fine-tuning platform. This is
+a genuinely small, genuinely local model instead (`LogisticRegression` /
+`RandomForestClassifier` / `GradientBoostingClassifier`), and more
+precisely, it's **trained from scratch**, not fine-tuned in the strict
+sense of adjusting pretrained weights. Described accurately rather than
+dressed up — the practical skill demonstrated (adapting a model to a
+specific task and dataset) is the same either way.
+
+Reuses `agent/analytics.py`'s feature engineering and real/synthetic
+fallback pattern; the target here is `review_approved` (binary), which is
+therefore excluded from the feature set to avoid target leakage.
+
+**Always compares against a majority-class baseline**, not just against
+itself — if no model beats blindly guessing the majority outcome, the
+summary says so explicitly rather than reporting a misleadingly "good"
+accuracy number on an imbalanced dataset. Verified in both directions: a
+synthetic dataset with a genuinely random target stays at baseline; one
+with a clean, real signal reaches ~100% cross-validated accuracy.
+
+**Honest limitation:** real approval outcomes so far are heavily skewed —
+most real runs across this project's own testing ended up `not_approved`.
+Training needs a reasonable count of *both* outcomes (≥5 each); with too
+few examples of one class, it refuses to report misleading metrics rather
+than training on an unusable split.
+
 ## Honest limitations
 
 - No JavaScript rendering for HTML parsing (though real Core Web Vitals do
@@ -503,7 +550,9 @@ Contentful Paint" the way a real embedding model would. Install
   compliance.
 - The eval harness measures recall of known-true issues, not full
   precision. Score Analytics results are only as trustworthy as the
-  sample size behind them (see the `reliable` flag).
+  sample size behind them (see the `reliable` flag). The Critic-Approval
+  Predictor refuses to train when either outcome class is too small,
+  rather than reporting a misleading accuracy number.
 - Groq's free tier has real daily quota limits per model *and*
   organization — multiple API keys only help if they're genuinely separate
   accounts, not just multiple keys on one.
@@ -528,5 +577,8 @@ Contentful Paint" the way a real embedding model would. Install
 - Wire Findings Similarity Search into the live pipeline — e.g. giving the
   synthesizer retrieved similar past fixes as grounding context instead of
   writing recommendations from scratch each time.
+- Wire the Critic-Approval Predictor into the live pipeline once its real
+  dataset is large and balanced enough — e.g. flagging a low predicted
+  approval probability before spending an actual critic call.
 - Hook `python main.py eval` (and `analyze`) into CI so a regression gets
   caught automatically, not just when someone notices in a manual run.
